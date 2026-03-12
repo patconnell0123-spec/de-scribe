@@ -1,4 +1,4 @@
-const CACHE_NAME = 'descibe-v30';
+const CACHE_NAME = 'descibe-v31';
 const ASSETS = [
   './',
   './index.html',
@@ -9,7 +9,8 @@ const ASSETS = [
   './icons/icon-512.png',
   'https://cdn.jsdelivr.net/npm/marked/marked.min.js',
   'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js',
-  'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css'
+  'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css',
+  'https://cdn.jsdelivr.net/npm/turndown/dist/turndown.js'
 ];
 
 self.addEventListener('install', e => {

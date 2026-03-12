@@ -2,14 +2,48 @@
    De'Scribe — Local-first Markdown Notes App
    ============================================================ */
 
-// ===== IndexedDB Wrapper =====
-const DB_NAME = 'describeDB';
-const DB_VERSION = 2;
+// ===== Profile System =====
+const DB_VERSION = 3;
 let db;
 
+function getProfiles() {
+  try { return JSON.parse(localStorage.getItem('describeProfiles')) || []; }
+  catch { return []; }
+}
+
+function saveProfiles(profiles) {
+  localStorage.setItem('describeProfiles', JSON.stringify(profiles));
+}
+
+function getActiveProfileId() {
+  return localStorage.getItem('describeActiveProfile') || 'default';
+}
+
+function setActiveProfileId(id) {
+  localStorage.setItem('describeActiveProfile', id);
+}
+
+function ensureDefaultProfile() {
+  let profiles = getProfiles();
+  if (profiles.length === 0) {
+    profiles = [{ id: 'default', name: 'Default' }];
+    saveProfiles(profiles);
+  }
+  if (!profiles.find(p => p.id === getActiveProfileId())) {
+    setActiveProfileId(profiles[0].id);
+  }
+}
+
+function getDBName(profileId) {
+  if (!profileId || profileId === 'default') return 'describeDB';
+  return 'describeDB_' + profileId;
+}
+
+// ===== IndexedDB Wrapper =====
 function openDB() {
+  const dbName = getDBName(getActiveProfileId());
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    const req = indexedDB.open(dbName, DB_VERSION);
     req.onupgradeneeded = e => {
       const d = e.target.result;
       if (!d.objectStoreNames.contains('notes'))
@@ -22,8 +56,28 @@ function openDB() {
         d.createObjectStore('settings', { keyPath: 'key' });
       if (!d.objectStoreNames.contains('slabs'))
         d.createObjectStore('slabs', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('kanban'))
+        d.createObjectStore('kanban', { keyPath: 'id' });
     };
     req.onsuccess = e => { db = e.target.result; resolve(db); };
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+function openDBForProfile(profileId) {
+  const dbName = getDBName(profileId);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(dbName, DB_VERSION);
+    req.onupgradeneeded = e => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains('notes')) d.createObjectStore('notes', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('folders')) d.createObjectStore('folders', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('images')) d.createObjectStore('images', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('settings')) d.createObjectStore('settings', { keyPath: 'key' });
+      if (!d.objectStoreNames.contains('slabs')) d.createObjectStore('slabs', { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('kanban')) d.createObjectStore('kanban', { keyPath: 'id' });
+    };
+    req.onsuccess = e => resolve(e.target.result);
     req.onerror = e => reject(e.target.error);
   });
 }
@@ -64,6 +118,15 @@ function dbDelete(store, key) {
   });
 }
 
+function dbClearStore(storeName) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = e => reject(e.target.error);
+  });
+}
+
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
@@ -73,6 +136,47 @@ let allNotes = [];
 let allFolders = [];
 let currentNote = null;
 let saveTimeout = null;
+let activeTagFilter = null;
+let sessionStartWords = 0;
+let richMode = false;
+let richSyncTimeout = null;
+
+// ===== Undo / Redo (last 3 changes) =====
+// Per-note history: Map<noteId, { stack: string[], pointer: number }>
+const undoHistories = new Map();
+const UNDO_MAX = 4; // current + 3 undoable states
+
+function getUndoHistory(noteId) {
+  if (!undoHistories.has(noteId)) {
+    undoHistories.set(noteId, { stack: [], pointer: -1 });
+  }
+  return undoHistories.get(noteId);
+}
+
+function undoPushState(noteId, content) {
+  const h = getUndoHistory(noteId);
+  // If pointer isn't at end, discard redo states
+  if (h.pointer < h.stack.length - 1) {
+    h.stack = h.stack.slice(0, h.pointer + 1);
+  }
+  // Don't push duplicate
+  if (h.stack.length > 0 && h.stack[h.stack.length - 1] === content) return;
+  h.stack.push(content);
+  // Trim to max
+  if (h.stack.length > UNDO_MAX) {
+    h.stack.shift();
+  }
+  h.pointer = h.stack.length - 1;
+}
+
+function undoApply(noteId, direction) {
+  const h = getUndoHistory(noteId);
+  if (h.stack.length === 0) return null;
+  const newPointer = h.pointer + direction;
+  if (newPointer < 0 || newPointer >= h.stack.length) return null;
+  h.pointer = newPointer;
+  return h.stack[h.pointer];
+}
 
 // ===== DOM refs =====
 const $sidebar = document.getElementById('sidebar');
@@ -88,6 +192,222 @@ const $searchInput = document.getElementById('header-search-input');
 const $searchDropdown = document.getElementById('header-search-dropdown');
 const $exportModal = document.getElementById('export-modal');
 const $contextMenu = document.getElementById('context-menu');
+const $saveDot = document.getElementById('save-dot');
+const $tagBar = document.getElementById('tag-bar');
+const $tagChips = document.getElementById('tag-chips');
+const $tagInput = document.getElementById('tag-input');
+const $tagAutocomplete = document.getElementById('tag-autocomplete');
+const $tagFilterBar = document.getElementById('tag-filter-bar');
+const $tagFilterWrapper = document.getElementById('tag-filter-wrapper');
+const $tagFilterHeader = document.getElementById('tag-filter-header');
+
+$tagFilterHeader.addEventListener('click', () => {
+  $tagFilterHeader.classList.toggle('expanded');
+  $tagFilterBar.classList.toggle('collapsed');
+});
+const $pinnedNotes = document.getElementById('pinned-notes');
+const $pinnedList = document.getElementById('pinned-list');
+const $templateDrawer = document.getElementById('template-drawer');
+const $templateHeader = document.getElementById('template-header');
+const $templateList = document.getElementById('template-list');
+
+const TEMPLATES = [
+  {
+    id: 'character-sheet',
+    name: 'Character Sheet',
+    icon: '\uD83E\uDDCD',
+    tags: ['character', 'worldbuilding'],
+    title: 'New Character',
+    content: `# Character Name
+
+## Basic Info
+| Attribute | Detail |
+|---|---|
+| **Full Name** | |
+| **Nickname(s)** | |
+| **Age** | |
+| **Gender** | |
+| **Species/Race** | |
+| **Occupation** | |
+
+## Appearance
+| Attribute | Detail |
+|---|---|
+| **Height** | |
+| **Weight/Build** | |
+| **Hair** | |
+| **Eyes** | |
+| **Skin** | |
+| **Distinguishing Features** | |
+
+## Personality
+| Trait | Detail |
+|---|---|
+| **Positive Traits** | |
+| **Negative Traits** | |
+| **Fears** | |
+| **Motivations** | |
+| **Habits/Quirks** | |
+
+## Background
+### Backstory
+> Write a brief history...
+
+### Key Relationships
+- **Family:**
+- **Friends:**
+- **Rivals/Enemies:**
+
+## Skills & Abilities
+-
+-
+-
+
+## Equipment / Possessions
+-
+-
+-
+
+## Notes
+> Additional details, arc ideas, story role...`
+  },
+  {
+    id: 'budget',
+    name: 'Budget Planner',
+    icon: '\uD83D\uDCB0',
+    tags: ['budget', 'finance'],
+    title: 'New Budget',
+    content: `<!-- budget -->
+# Budget Planner
+
+## Income
+| Source | Monthly Amount |
+|---|---|
+| Salary | 0 |
+| Freelance | 0 |
+| Investments | 0 |
+| Side Hustle | 0 |
+| Other | 0 |
+
+## Fixed Expenses
+| Category | Monthly Amount |
+|---|---|
+| Rent/Mortgage | 0 |
+| Utilities | 0 |
+| Insurance | 0 |
+| Subscriptions | 0 |
+| Loan Payments | 0 |
+| Phone/Internet | 0 |
+
+## Variable Expenses
+| Category | Monthly Amount |
+|---|---|
+| Groceries | 0 |
+| Dining Out | 0 |
+| Transportation | 0 |
+| Entertainment | 0 |
+| Shopping | 0 |
+| Health/Fitness | 0 |
+| Personal Care | 0 |
+| Miscellaneous | 0 |
+
+## Savings & Goals
+| Goal | Monthly Contribution |
+|---|---|
+| Emergency Fund | 0 |
+| Retirement | 0 |
+| Vacation | 0 |
+| Other Savings | 0 |
+
+## Projections
+> The charts below are generated automatically from your tables above. Edit the amounts and switch between preview modes to see updated graphs.
+
+## Notes
+> Track anomalies, upcoming changes, or financial goals here...`
+  }
+];
+
+$templateHeader.addEventListener('click', () => {
+  $templateHeader.classList.toggle('expanded');
+  $templateList.classList.toggle('collapsed');
+});
+
+function renderTemplates() {
+  $templateList.innerHTML = '';
+  TEMPLATES.forEach(tmpl => {
+    const div = document.createElement('div');
+    div.className = 'template-item';
+    div.draggable = true;
+
+    const icon = document.createElement('span');
+    icon.className = 'template-item-icon';
+    icon.textContent = tmpl.icon;
+
+    const label = document.createElement('span');
+    label.textContent = tmpl.name;
+
+    div.append(icon, label);
+
+    div.addEventListener('dragstart', e => {
+      dragItem = { type: 'template', id: tmpl.id };
+      e.dataTransfer.effectAllowed = 'copy';
+      e.dataTransfer.setData('text/plain', JSON.stringify(dragItem));
+    });
+
+    div.addEventListener('click', async () => {
+      const note = await createNoteFromTemplate(tmpl.id, null);
+      if (note) openNote(note.id);
+    });
+
+    $templateList.appendChild(div);
+  });
+}
+
+async function createNoteFromTemplate(templateId, folderId) {
+  const tmpl = TEMPLATES.find(t => t.id === templateId);
+  if (!tmpl) return null;
+  const note = {
+    id: uid(),
+    folderId: folderId || null,
+    title: tmpl.title,
+    content: tmpl.content,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sortOrder: allNotes.length,
+    tags: [...(tmpl.tags || [])]
+  };
+  await dbPut('notes', note);
+  allNotes.push(note);
+  renderTree();
+  return note;
+}
+const $wordGoalBar = document.getElementById('word-goal-bar');
+const $wordCountWrapper = document.getElementById('word-count-wrapper');
+const $folderColorPicker = document.getElementById('folder-color-picker');
+
+// ===== Auto-Save Indicator (Feature 1) =====
+let saveDotTimer = null;
+
+function setSaveStatus(state) {
+  $saveDot.className = '';
+  if (state === 'typing') {
+    $saveDot.classList.add('typing');
+    $statusMsg.textContent = 'Typing...';
+  } else if (state === 'saving') {
+    $saveDot.classList.add('saving');
+    $statusMsg.textContent = 'Saving...';
+  } else if (state === 'saved') {
+    $saveDot.classList.add('saved');
+    $statusMsg.textContent = 'Saved';
+    clearTimeout(saveDotTimer);
+    saveDotTimer = setTimeout(() => {
+      $saveDot.className = '';
+      $statusMsg.textContent = 'Ready';
+    }, 2500);
+  } else {
+    $statusMsg.textContent = 'Ready';
+  }
+}
 
 // ===== Markdown Setup =====
 marked.setOptions({
@@ -103,6 +423,8 @@ marked.setOptions({
 
 // ===== Init =====
 async function init() {
+  ensureDefaultProfile();
+  renderProfileSwitcher();
   await openDB();
   allNotes = await dbGetAll('notes');
   allFolders = await dbGetAll('folders');
@@ -114,6 +436,7 @@ async function init() {
   if (sidebarWidth) $sidebar.style.width = sidebarWidth.value + 'px';
 
   renderTree();
+  renderTemplates();
   setEditorState(false);
 
   const lastNote = await dbGet('settings', 'lastNote');
@@ -126,6 +449,7 @@ async function init() {
   if (lastView) setViewMode(lastView.value);
 
   await loadSlabs();
+  allKanbanBoards = await dbGetAll('kanban') || [];
 
   setupEventListeners();
 
@@ -141,11 +465,18 @@ function renderTree() {
 
   const slabs = allSlabBoards.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
 
+  // Filter notes by active tag if set
+  const filteredNoteIds = activeTagFilter
+    ? new Set(allNotes.filter(n => !n.deleted && (n.tags || []).includes(activeTagFilter)).map(n => n.id))
+    : null;
+
   function buildLevel(parentId) {
     const ul = document.createElement('ul');
     const childFolders = folders.filter(f => (f.parentId || null) === parentId);
-    const childNotes = notes.filter(n => (n.folderId || null) === parentId && !n.deleted);
+    let childNotes = notes.filter(n => (n.folderId || null) === parentId && !n.deleted);
+    if (filteredNoteIds) childNotes = childNotes.filter(n => filteredNoteIds.has(n.id));
     const childSlabs = slabs.filter(b => (b.folderId || null) === parentId);
+    const childKanbans = allKanbanBoards.filter(b => (b.folderId || null) === parentId);
 
     childFolders.forEach(folder => {
       const li = document.createElement('li');
@@ -155,6 +486,7 @@ function renderTree() {
       div.dataset.type = 'folder';
       div.dataset.id = folder.id;
       div.draggable = true;
+      if (folder.color) div.style.borderLeft = '3px solid ' + folder.color;
 
       const arrow = document.createElement('span');
       arrow.className = 'tree-folder-icon' + (folder.collapsed ? ' collapsed' : '');
@@ -179,12 +511,13 @@ function renderTree() {
       ul.appendChild(li);
     });
 
-    childNotes.forEach(note => {
+    childKanbans.forEach(board => {
       const li = document.createElement('li');
       const div = document.createElement('div');
-      div.className = 'tree-item' + (currentNote && currentNote.id === note.id ? ' active' : '');
-      div.dataset.type = 'note';
-      div.dataset.id = note.id;
+      const isActiveKanban = !$kanbanView.classList.contains('hidden') && currentKanbanId === board.id;
+      div.className = 'tree-item' + (isActiveKanban ? ' active' : '');
+      div.dataset.type = 'kanban';
+      div.dataset.id = board.id;
       div.draggable = true;
 
       const spacer = document.createElement('span');
@@ -193,11 +526,11 @@ function renderTree() {
 
       const icon = document.createElement('span');
       icon.className = 'tree-item-icon';
-      icon.textContent = '\uD83D\uDCC4';
+      icon.textContent = '\u2610';
 
       const label = document.createElement('span');
       label.className = 'tree-item-label';
-      label.textContent = note.title;
+      label.textContent = board.name;
 
       div.append(spacer, icon, label);
       li.appendChild(div);
@@ -230,11 +563,91 @@ function renderTree() {
       ul.appendChild(li);
     });
 
+    childNotes.forEach(note => {
+      const li = document.createElement('li');
+      const div = document.createElement('div');
+      div.className = 'tree-item' + (currentNote && currentNote.id === note.id ? ' active' : '');
+      div.dataset.type = 'note';
+      div.dataset.id = note.id;
+      div.draggable = true;
+
+      const spacer = document.createElement('span');
+      spacer.style.width = '14px';
+      spacer.style.flexShrink = '0';
+
+      const icon = document.createElement('span');
+      icon.className = 'tree-item-icon';
+      icon.textContent = '\uD83D\uDCC4';
+
+      const label = document.createElement('span');
+      label.className = 'tree-item-label';
+      label.textContent = note.title;
+
+      div.append(spacer, icon, label);
+
+      // Pin badge if pinned
+      if (note.pinned) {
+        const badge = document.createElement('span');
+        badge.className = 'pin-badge';
+        badge.textContent = '\uD83D\uDCCC';
+        div.appendChild(badge);
+      }
+
+      li.appendChild(div);
+      ul.appendChild(li);
+    });
+
     return ul;
   }
 
   $tree.innerHTML = '';
   $tree.appendChild(buildLevel(null));
+
+  // Render pinned notes
+  renderPinnedNotes();
+
+  // Render tag filter bar
+  renderTagFilterBar();
+}
+
+// ===== Pinned Notes (Feature 2) =====
+function renderPinnedNotes() {
+  const pinned = allNotes
+    .filter(n => n.pinned && !n.deleted)
+    .sort((a, b) => (a.pinnedAt || 0) - (b.pinnedAt || 0));
+
+  if (pinned.length === 0) {
+    $pinnedNotes.classList.add('hidden');
+    return;
+  }
+
+  $pinnedNotes.classList.remove('hidden');
+  $pinnedList.innerHTML = '';
+
+  pinned.forEach(note => {
+    const li = document.createElement('li');
+    const div = document.createElement('div');
+    div.className = 'tree-item' + (currentNote && currentNote.id === note.id ? ' active' : '');
+    div.dataset.type = 'note';
+    div.dataset.id = note.id;
+
+    const icon = document.createElement('span');
+    icon.className = 'tree-item-icon';
+    icon.textContent = '\uD83D\uDCCC';
+
+    const label = document.createElement('span');
+    label.className = 'tree-item-label';
+    label.textContent = note.title;
+
+    div.append(icon, label);
+    div.addEventListener('click', () => openNote(note.id));
+    div.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      showContextMenu(e.clientX, e.clientY, 'note', note.id);
+    });
+    li.appendChild(div);
+    $pinnedList.appendChild(li);
+  });
 }
 
 // ===== Tree Interactions =====
@@ -266,6 +679,8 @@ $tree.addEventListener('click', async e => {
       openNote(id);
     } else if (type === 'slab') {
       openSlabView(id);
+    } else if (type === 'kanban') {
+      openKanbanView(id);
     }
   }, 250);
 });
@@ -300,6 +715,9 @@ function startInlineRename(type, id) {
     } else if (type === 'slab') {
       const board = allSlabBoards.find(b => b.id === id);
       if (board) { board.name = newName; await dbPut('slabs', board); }
+    } else if (type === 'kanban') {
+      const board = allKanbanBoards.find(b => b.id === id);
+      if (board) { board.name = newName; await dbPut('kanban', board); if (currentKanbanId === id) document.getElementById('kanban-toolbar-name').textContent = '\u2610 ' + newName; }
     } else {
       const note = allNotes.find(n => n.id === id);
       if (note) { note.title = newName; await dbPut('notes', note); if (currentNote && currentNote.id === id) $noteTitleInput.value = newName; }
@@ -367,9 +785,15 @@ $tree.addEventListener('drop', async e => {
     } else if (dragItem.type === 'slab') {
       const board = allSlabBoards.find(b => b.id === dragItem.id);
       if (board) { board.folderId = null; await dbPut('slabs', board); }
+    } else if (dragItem.type === 'kanban') {
+      const board = allKanbanBoards.find(b => b.id === dragItem.id);
+      if (board) { board.folderId = null; await dbPut('kanban', board); }
     } else if (dragItem.type === 'folder') {
       const folder = allFolders.find(f => f.id === dragItem.id);
       if (folder) { folder.parentId = null; await dbPut('folders', folder); }
+    } else if (dragItem.type === 'template') {
+      const note = await createNoteFromTemplate(dragItem.id, null);
+      if (note) openNote(note.id);
     }
     dragItem = null;
     renderTree();
@@ -387,6 +811,12 @@ $tree.addEventListener('drop', async e => {
     } else if (dragItem.type === 'slab') {
       const board = allSlabBoards.find(b => b.id === dragItem.id);
       if (board) { board.folderId = targetId; await dbPut('slabs', board); }
+    } else if (dragItem.type === 'kanban') {
+      const board = allKanbanBoards.find(b => b.id === dragItem.id);
+      if (board) { board.folderId = targetId; await dbPut('kanban', board); }
+    } else if (dragItem.type === 'template') {
+      const note = await createNoteFromTemplate(dragItem.id, targetId);
+      if (note) openNote(note.id);
     } else {
       const folder = allFolders.find(f => f.id === dragItem.id);
       if (folder && targetId !== folder.id) {
@@ -435,6 +865,20 @@ function showContextMenu(x, y, type, id) {
   $contextMenu.style.left = x + 'px';
   $contextMenu.style.top = y + 'px';
   document.getElementById('ctx-new-note').style.display = type === 'folder' ? '' : 'none';
+
+  // Pin option: only for notes
+  const pinBtn = document.getElementById('ctx-pin');
+  if (type === 'note') {
+    pinBtn.style.display = '';
+    const note = allNotes.find(n => n.id === id);
+    pinBtn.innerHTML = note && note.pinned ? '&#128204; Unpin' : '&#128204; Pin';
+  } else {
+    pinBtn.style.display = 'none';
+  }
+
+  // Color option: only for folders
+  document.getElementById('ctx-color').style.display = type === 'folder' ? '' : 'none';
+
   $contextMenu.classList.remove('hidden');
 }
 
@@ -469,6 +913,20 @@ $contextMenu.addEventListener('click', async e => {
     startInlineRename('note', note.id);
   }
 
+  if (action === 'pin') {
+    const note = allNotes.find(n => n.id === ctxTarget.id);
+    if (note) {
+      note.pinned = !note.pinned;
+      note.pinnedAt = note.pinned ? Date.now() : null;
+      await dbPut('notes', note);
+      renderTree();
+    }
+  }
+
+  if (action === 'color') {
+    showFolderColorPicker(ctxTarget.id);
+  }
+
   if (action === 'rename') {
     startInlineRename(ctxTarget.type, ctxTarget.id);
   }
@@ -477,6 +935,7 @@ $contextMenu.addEventListener('click', async e => {
     let name;
     if (ctxTarget.type === 'folder') name = allFolders.find(f => f.id === ctxTarget.id)?.name;
     else if (ctxTarget.type === 'slab') name = allSlabBoards.find(b => b.id === ctxTarget.id)?.name;
+    else if (ctxTarget.type === 'kanban') name = allKanbanBoards.find(b => b.id === ctxTarget.id)?.name;
     else name = allNotes.find(n => n.id === ctxTarget.id)?.title;
     if (!confirm(`Delete "${name}"?`)) return;
 
@@ -492,6 +951,13 @@ $contextMenu.addEventListener('click', async e => {
           closeSlabView();
           currentSlabId = null;
         }
+      }
+    } else if (ctxTarget.type === 'kanban') {
+      allKanbanBoards = allKanbanBoards.filter(b => b.id !== ctxTarget.id);
+      await dbDelete('kanban', ctxTarget.id);
+      if (currentKanbanId === ctxTarget.id) {
+        closeKanbanView();
+        currentKanbanId = null;
       }
     } else {
       await deleteNote(ctxTarget.id);
@@ -710,10 +1176,29 @@ const $noteTitleInput = document.getElementById('note-title-input');
 function openNote(id) {
   const note = allNotes.find(n => n.id === id);
   if (!note) return;
+
+  // Close venn view if open
+  if (!$vennView.classList.contains('hidden')) closeVennView();
+  if (!$kanbanView.classList.contains('hidden')) closeKanbanView();
+
+  // If exiting rich mode, sync first
+  if (richMode && currentNote) syncRichToMarkdown();
+  richMode = false;
+  $preview.contentEditable = 'false';
+  $preview.classList.remove('rich-editable');
+
   currentNote = note;
   $editor.value = note.content;
   $noteTitleInput.value = note.title;
   $noteTitleBar.classList.remove('hidden');
+
+  // Seed undo history with current content
+  undoPushState(note.id, note.content);
+
+  // Track session start words for word goal
+  const text = note.content.trim();
+  sessionStartWords = text ? text.split(/\s+/).length : 0;
+
   updatePreview();
   updateWordCount();
   updateEditorBranchMarkers();
@@ -722,6 +1207,7 @@ function openNote(id) {
   setEditorState(true);
   renderTree();
   renderBranchPanel();
+  renderTagBar();
   dbPut('settings', { key: 'lastNote', value: id });
 }
 
@@ -730,10 +1216,12 @@ $noteTitleInput.addEventListener('input', async () => {
   const newTitle = $noteTitleInput.value.trim() || 'Untitled';
   currentNote.title = newTitle;
   currentNote.updatedAt = Date.now();
+  setSaveStatus('typing');
   clearTimeout(saveTimeout);
   saveTimeout = setTimeout(async () => {
+    setSaveStatus('saving');
     await dbPut('notes', currentNote);
-    $statusMsg.textContent = 'Saved';
+    setSaveStatus('saved');
   }, 400);
   renderTree();
 });
@@ -806,6 +1294,7 @@ function setEditorState(hasNote) {
     $preview.innerHTML = '';
     $branchPanel.classList.add('hidden');
     $noteTitleBar.classList.add('hidden');
+    $tagBar.classList.add('hidden');
   }
 }
 
@@ -819,12 +1308,14 @@ $editor.addEventListener('input', () => {
   updatePreview();
   updateWordCount();
   updateEditorHighlight();
-  $statusMsg.textContent = 'Typing...';
+  setSaveStatus('typing');
 
   clearTimeout(saveTimeout);
   saveTimeout = setTimeout(async () => {
+    setSaveStatus('saving');
     await dbPut('notes', currentNote);
-    $statusMsg.textContent = 'Saved';
+    undoPushState(currentNote.id, currentNote.content);
+    setSaveStatus('saved');
     renderTree();
   }, 500);
 });
@@ -893,6 +1384,306 @@ async function updatePreview() {
   $preview.querySelectorAll('pre code').forEach(block => {
     hljs.highlightElement(block);
   });
+
+  // Budget chart rendering
+  if (currentNote && currentNote.content.trimStart().startsWith('<!-- budget -->')) {
+    renderBudgetCharts($preview);
+  }
+}
+
+function parseBudgetTables(container) {
+  const sections = { income: [], fixedExpenses: [], variableExpenses: [], savings: [] };
+  const headings = container.querySelectorAll('h2');
+  headings.forEach(h2 => {
+    const text = h2.textContent.trim().toLowerCase();
+    const table = h2.nextElementSibling;
+    if (!table || table.tagName !== 'TABLE') return;
+    const rows = table.querySelectorAll('tbody tr');
+    let key = null;
+    if (text === 'income') key = 'income';
+    else if (text === 'fixed expenses') key = 'fixedExpenses';
+    else if (text === 'variable expenses') key = 'variableExpenses';
+    else if (text.includes('savings')) key = 'savings';
+    if (!key) return;
+    rows.forEach(row => {
+      const cells = row.querySelectorAll('td');
+      if (cells.length >= 2) {
+        const label = cells[0].textContent.trim();
+        const amount = parseFloat(cells[1].textContent.replace(/[^0-9.\-]/g, '')) || 0;
+        if (label) sections[key].push({ label, amount });
+      }
+    });
+  });
+  return sections;
+}
+
+function renderBudgetCharts(container) {
+  const data = parseBudgetTables(container);
+  const totalIncome = data.income.reduce((s, r) => s + r.amount, 0);
+  const totalFixed = data.fixedExpenses.reduce((s, r) => s + r.amount, 0);
+  const totalVariable = data.variableExpenses.reduce((s, r) => s + r.amount, 0);
+  const totalSavings = data.savings.reduce((s, r) => s + r.amount, 0);
+  const totalExpenses = totalFixed + totalVariable;
+  const netMonthly = totalIncome - totalExpenses - totalSavings;
+
+  // Find or create the chart container after the Projections heading
+  let anchor = null;
+  container.querySelectorAll('h2').forEach(h => {
+    if (h.textContent.trim().toLowerCase() === 'projections') anchor = h;
+  });
+  if (!anchor) return;
+
+  // Remove the blockquote hint after projections heading
+  const hint = anchor.nextElementSibling;
+  if (hint && hint.tagName === 'BLOCKQUOTE') hint.remove();
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'budget-dashboard';
+
+  // Time period selector
+  const periods = [
+    { label: '1 Month', months: 1 },
+    { label: '3 Months', months: 3 },
+    { label: '6 Months', months: 6 },
+    { label: '12 Months', months: 12 }
+  ];
+
+  const toolbar = document.createElement('div');
+  toolbar.className = 'budget-toolbar';
+  let activeMonths = 1;
+
+  periods.forEach((p, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'budget-period-btn' + (i === 0 ? ' active' : '');
+    btn.textContent = p.label;
+    btn.addEventListener('click', () => {
+      toolbar.querySelectorAll('.budget-period-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      activeMonths = p.months;
+      updateDashboard();
+    });
+    toolbar.appendChild(btn);
+  });
+  wrapper.appendChild(toolbar);
+
+  // Summary cards
+  const summaryRow = document.createElement('div');
+  summaryRow.className = 'budget-summary';
+  wrapper.appendChild(summaryRow);
+
+  // Chart area — two canvases side by side
+  const chartRow = document.createElement('div');
+  chartRow.className = 'budget-chart-row';
+
+  const barSection = document.createElement('div');
+  barSection.className = 'budget-chart-section';
+  const barTitle = document.createElement('div');
+  barTitle.className = 'budget-chart-title';
+  barTitle.textContent = 'Income vs Expenses';
+  const barCanvas = document.createElement('canvas');
+  barCanvas.width = 400; barCanvas.height = 260;
+  barSection.append(barTitle, barCanvas);
+
+  const pieSection = document.createElement('div');
+  pieSection.className = 'budget-chart-section';
+  const pieTitle = document.createElement('div');
+  pieTitle.className = 'budget-chart-title';
+  pieTitle.textContent = 'Expense Breakdown';
+  const pieCanvas = document.createElement('canvas');
+  pieCanvas.width = 300; pieCanvas.height = 260;
+  pieSection.append(pieTitle, pieCanvas);
+
+  chartRow.append(barSection, pieSection);
+  wrapper.appendChild(chartRow);
+
+  // Projection table
+  const projDiv = document.createElement('div');
+  projDiv.className = 'budget-projection-table';
+  wrapper.appendChild(projDiv);
+
+  anchor.after(wrapper);
+
+  const fmt = n => {
+    const sign = n < 0 ? '-' : '';
+    return sign + '$' + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  };
+
+  function updateDashboard() {
+    const m = activeMonths;
+    const inc = totalIncome * m;
+    const exp = totalExpenses * m;
+    const sav = totalSavings * m;
+    const net = netMonthly * m;
+
+    // Summary cards
+    summaryRow.innerHTML = '';
+    const cards = [
+      { label: 'Total Income', value: inc, cls: 'income' },
+      { label: 'Total Expenses', value: exp, cls: 'expense' },
+      { label: 'Total Savings', value: sav, cls: 'savings' },
+      { label: 'Net Balance', value: net, cls: net >= 0 ? 'income' : 'expense' }
+    ];
+    cards.forEach(c => {
+      const card = document.createElement('div');
+      card.className = 'budget-card budget-card-' + c.cls;
+      card.innerHTML = `<div class="budget-card-label">${c.label}</div><div class="budget-card-value">${fmt(c.value)}</div><div class="budget-card-sub">${m > 1 ? fmt(c.value / m) + '/mo' : ''}</div>`;
+      summaryRow.appendChild(card);
+    });
+
+    // Bar chart
+    drawBarChart(barCanvas, data, m);
+
+    // Pie chart
+    drawPieChart(pieCanvas, data, m);
+
+    // Projection table
+    projDiv.innerHTML = '';
+    const table = document.createElement('table');
+    table.className = 'budget-proj-tbl';
+    let thtml = '<thead><tr><th>Month</th><th>Income</th><th>Expenses</th><th>Savings</th><th>Net</th><th>Cumulative</th></tr></thead><tbody>';
+    let cumulative = 0;
+    for (let i = 1; i <= m; i++) {
+      cumulative += netMonthly;
+      thtml += `<tr><td>${i}</td><td>${fmt(totalIncome)}</td><td>${fmt(totalExpenses)}</td><td>${fmt(totalSavings)}</td><td class="${netMonthly >= 0 ? 'proj-pos' : 'proj-neg'}">${fmt(netMonthly)}</td><td class="${cumulative >= 0 ? 'proj-pos' : 'proj-neg'}">${fmt(cumulative)}</td></tr>`;
+    }
+    thtml += '</tbody>';
+    table.innerHTML = thtml;
+    projDiv.appendChild(table);
+  }
+
+  updateDashboard();
+}
+
+function drawBarChart(canvas, data, months) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const categories = [
+    { label: 'Income', value: data.income.reduce((s, r) => s + r.amount, 0) * months, color: '#a6e3a1' },
+    { label: 'Fixed', value: data.fixedExpenses.reduce((s, r) => s + r.amount, 0) * months, color: '#f38ba8' },
+    { label: 'Variable', value: data.variableExpenses.reduce((s, r) => s + r.amount, 0) * months, color: '#fab387' },
+    { label: 'Savings', value: data.savings.reduce((s, r) => s + r.amount, 0) * months, color: '#89b4fa' }
+  ];
+
+  const maxVal = Math.max(...categories.map(c => c.value), 1);
+  const pad = { top: 10, bottom: 30, left: 10, right: 10 };
+  const chartW = w - pad.left - pad.right;
+  const chartH = h - pad.top - pad.bottom;
+  const barW = chartW / categories.length * 0.6;
+  const gap = chartW / categories.length;
+
+  const textColor = getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim();
+  ctx.fillStyle = textColor;
+  ctx.font = '11px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+
+  categories.forEach((cat, i) => {
+    const x = pad.left + gap * i + (gap - barW) / 2;
+    const barH = (cat.value / maxVal) * chartH;
+    const y = pad.top + chartH - barH;
+
+    ctx.fillStyle = cat.color;
+    ctx.beginPath();
+    const r = 4;
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + barW - r, y);
+    ctx.quadraticCurveTo(x + barW, y, x + barW, y + r);
+    ctx.lineTo(x + barW, y + barH);
+    ctx.lineTo(x, y + barH);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.fill();
+
+    ctx.fillStyle = textColor;
+    ctx.fillText(cat.label, x + barW / 2, h - 8);
+
+    if (cat.value > 0) {
+      ctx.fillStyle = textColor;
+      ctx.fillText('$' + cat.value.toLocaleString(), x + barW / 2, y - 4);
+    }
+  });
+}
+
+function drawPieChart(canvas, data, months) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const allExpenses = [...data.fixedExpenses, ...data.variableExpenses]
+    .filter(r => r.amount > 0)
+    .map(r => ({ label: r.label, value: r.amount * months }));
+
+  if (allExpenses.length === 0) {
+    const textColor = getComputedStyle(document.documentElement).getPropertyValue('--text-muted').trim();
+    ctx.fillStyle = textColor;
+    ctx.font = '13px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No expense data', w / 2, h / 2);
+    return;
+  }
+
+  const total = allExpenses.reduce((s, r) => s + r.value, 0);
+  const colors = ['#f38ba8', '#fab387', '#f9e2af', '#a6e3a1', '#89b4fa', '#cba6f7', '#f5c2e7', '#94e2d5', '#74c7ec', '#b4befe', '#f2cdcd', '#89dceb', '#eba0ac', '#a6adc8'];
+  const cx = w / 2, cy = h / 2 - 10, radius = Math.min(w, h) / 2 - 30;
+  let startAngle = -Math.PI / 2;
+
+  const textColor = getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim();
+
+  allExpenses.forEach((item, i) => {
+    const slice = (item.value / total) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, radius, startAngle, startAngle + slice);
+    ctx.closePath();
+    ctx.fillStyle = colors[i % colors.length];
+    ctx.fill();
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg-primary').trim();
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Label
+    if (slice > 0.15) {
+      const mid = startAngle + slice / 2;
+      const lx = cx + Math.cos(mid) * (radius * 0.65);
+      const ly = cy + Math.sin(mid) * (radius * 0.65);
+      ctx.fillStyle = '#1e1e2e';
+      ctx.font = 'bold 10px -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(item.label, lx, ly - 6);
+      ctx.font = '9px -apple-system, sans-serif';
+      ctx.fillText(Math.round(item.value / total * 100) + '%', lx, ly + 6);
+    }
+
+    startAngle += slice;
+  });
+
+  // Legend below
+  ctx.font = '10px -apple-system, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  const legendY = cy + radius + 12;
+  const cols = Math.min(allExpenses.length, 4);
+  const colW = w / cols;
+  allExpenses.forEach((item, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const lx = col * colW + 4;
+    const ly = legendY + row * 14;
+    ctx.fillStyle = colors[i % colors.length];
+    ctx.fillRect(lx, ly, 8, 8);
+    ctx.fillStyle = textColor;
+    ctx.fillText(item.label, lx + 12, ly - 1);
+  });
 }
 
 // Navigate to linked note when wiki link is clicked
@@ -907,9 +1698,27 @@ $preview.addEventListener('click', e => {
 });
 
 function updateWordCount() {
-  const text = $editor.value.trim();
+  const text = (currentNote ? currentNote.content : $editor.value).trim();
   const words = text ? text.split(/\s+/).length : 0;
-  $wordCount.textContent = `${words} word${words !== 1 ? 's' : ''}`;
+
+  if (currentNote && currentNote.wordGoal) {
+    const goal = currentNote.wordGoal;
+    $wordCount.textContent = `${words} / ${goal} words`;
+    const pct = Math.min(100, (words / goal) * 100);
+    $wordGoalBar.style.width = pct + '%';
+
+    if (words >= goal) {
+      if (!$wordCountWrapper.classList.contains('goal-complete')) {
+        $wordCountWrapper.classList.add('goal-complete');
+      }
+    } else {
+      $wordCountWrapper.classList.remove('goal-complete');
+    }
+  } else {
+    $wordCount.textContent = `${words} word${words !== 1 ? 's' : ''}`;
+    $wordGoalBar.style.width = '0%';
+    $wordCountWrapper.classList.remove('goal-complete');
+  }
 }
 
 // ===== Toolbar =====
@@ -922,6 +1731,31 @@ document.getElementById('toolbar').addEventListener('click', e => {
 
 function applyFormat(action) {
   if (!currentNote) return;
+
+  // Rich mode: use execCommand
+  if (richMode) {
+    switch (action) {
+      case 'bold': document.execCommand('bold'); break;
+      case 'italic': document.execCommand('italic'); break;
+      case 'h1': document.execCommand('formatBlock', false, 'h1'); break;
+      case 'h2': document.execCommand('formatBlock', false, 'h2'); break;
+      case 'h3': document.execCommand('formatBlock', false, 'h3'); break;
+      case 'code': document.execCommand('insertHTML', false, '<code>code</code>'); break;
+      case 'ul': document.execCommand('insertUnorderedList'); break;
+      case 'ol': document.execCommand('insertOrderedList'); break;
+      case 'blockquote': document.execCommand('formatBlock', false, 'blockquote'); break;
+      case 'hr': document.execCommand('insertHorizontalRule'); break;
+      case 'link':
+        const url = prompt('URL:');
+        if (url) document.execCommand('createLink', false, url);
+        break;
+      case 'image': triggerImageInsert(); break;
+    }
+    clearTimeout(richSyncTimeout);
+    richSyncTimeout = setTimeout(() => syncRichToMarkdown(), 500);
+    return;
+  }
+
   const start = $editor.selectionStart;
   const end = $editor.selectionEnd;
   const sel = $editor.value.substring(start, end);
@@ -1352,6 +2186,43 @@ document.addEventListener('keydown', e => {
     $searchInput.focus();
     $searchInput.select();
   }
+  // Ctrl+Z Undo / Ctrl+Shift+Z Redo (note content, last 3 changes)
+  if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
+    if (currentNote) {
+      const prev = undoApply(currentNote.id, -1);
+      if (prev !== null) {
+        e.preventDefault();
+        currentNote.content = prev;
+        currentNote.updatedAt = Date.now();
+        $editor.value = prev;
+        updatePreview();
+        updateWordCount();
+        updateEditorHighlight();
+        updateMinimapContent();
+        setSaveStatus('saving');
+        dbPut('notes', currentNote).then(() => setSaveStatus('saved'));
+        renderTree();
+      }
+    }
+  }
+  if (e.ctrlKey && e.shiftKey && e.key === 'Z') {
+    if (currentNote) {
+      const next = undoApply(currentNote.id, 1);
+      if (next !== null) {
+        e.preventDefault();
+        currentNote.content = next;
+        currentNote.updatedAt = Date.now();
+        $editor.value = next;
+        updatePreview();
+        updateWordCount();
+        updateEditorHighlight();
+        updateMinimapContent();
+        setSaveStatus('saving');
+        dbPut('notes', currentNote).then(() => setSaveStatus('saved'));
+        renderTree();
+      }
+    }
+  }
   // Escape close modals/dropdowns
   if (e.key === 'Escape') {
     closeSearchDropdown();
@@ -1376,10 +2247,74 @@ document.getElementById('view-split').addEventListener('click', () => setViewMod
 document.getElementById('view-preview').addEventListener('click', () => setViewMode('view-preview'));
 
 function setViewMode(mode) {
+  // Leaving rich mode: sync back
+  if (richMode && mode !== 'view-rich') {
+    syncRichToMarkdown();
+    richMode = false;
+    $preview.contentEditable = 'false';
+    $preview.classList.remove('rich-editable');
+  }
+
   $editorContainer.className = mode;
   document.querySelectorAll('.view-btn').forEach(b => b.classList.remove('active'));
   document.getElementById(mode)?.classList.add('active');
+
+  // Entering rich mode
+  if (mode === 'view-rich') {
+    richMode = true;
+    $preview.contentEditable = 'true';
+    $preview.classList.add('rich-editable');
+    updatePreview();
+    // Listen for rich mode input
+    $preview.oninput = () => {
+      clearTimeout(richSyncTimeout);
+      richSyncTimeout = setTimeout(() => {
+        syncRichToMarkdown();
+      }, 500);
+    };
+    // Strip HTML on paste in rich mode
+    $preview.onpaste = e => {
+      e.preventDefault();
+      // Allow image paste
+      const items = e.clipboardData?.items;
+      if (items) {
+        for (const item of items) {
+          if (item.type.startsWith('image/')) {
+            insertImage(item.getAsFile());
+            return;
+          }
+        }
+      }
+      const text = e.clipboardData.getData('text/plain');
+      document.execCommand('insertText', false, text);
+    };
+  } else {
+    $preview.contentEditable = 'false';
+    $preview.classList.remove('rich-editable');
+    $preview.oninput = null;
+    $preview.onpaste = null;
+  }
+
   dbPut('settings', { key: 'viewMode', value: mode });
+}
+
+function syncRichToMarkdown() {
+  if (!richMode || !currentNote) return;
+  const td = getTurndown();
+  if (!td) return;
+  const md = td.turndown($preview.innerHTML);
+  currentNote.content = md;
+  currentNote.updatedAt = Date.now();
+  $editor.value = md;
+  setSaveStatus('typing');
+  clearTimeout(saveTimeout);
+  saveTimeout = setTimeout(async () => {
+    setSaveStatus('saving');
+    await dbPut('notes', currentNote);
+    undoPushState(currentNote.id, currentNote.content);
+    setSaveStatus('saved');
+    updateWordCount();
+  }, 500);
 }
 
 // ===== Images =====
@@ -1459,7 +2394,8 @@ $searchInput.addEventListener('input', () => {
   const results = allNotes.filter(n =>
     !n.deleted &&
     (n.title.toLowerCase().includes(query) ||
-    n.content.toLowerCase().includes(query))
+    n.content.toLowerCase().includes(query) ||
+    (n.tags || []).some(t => t.includes(query)))
   ).slice(0, 12);
 
   searchSelectedIdx = -1;
@@ -1641,9 +2577,11 @@ function openSlabView(slabId) {
   dbPut('settings', { key: 'lastSlab', value: slabId });
   loadCurrentSlab();
 
-  // Show slab, hide editor
+  // Show slab, hide editor + venn + kanban
   $editorArea.classList.add('hidden');
   $neuralSlab.classList.remove('hidden');
+  $vennView.classList.add('hidden');
+  $kanbanView.classList.add('hidden');
 
   // Update toolbar name
   const board = getCurrentBoard();
@@ -1675,6 +2613,15 @@ let slabIsPanning = false;
 let slabPanStart = { x: 0, y: 0 };
 
 const SLAB_COLORS = ['#89b4fa', '#a6e3a1', '#f9e2af', '#f38ba8', '#cba6f7', '#74c7ec', '#fab387'];
+
+// ===== Kanban State =====
+let allKanbanBoards = [];
+let currentKanbanId = null;
+let kanbanDragCard = null;
+let kanbanDragCol = null;
+let kanbanEditCardId = null;
+const $kanbanView = document.getElementById('kanban-view');
+const $kanbanBoard = document.getElementById('kanban-board');
 
 async function loadSlabs() {
   allSlabBoards = await dbGetAll('slabs') || [];
@@ -2377,6 +3324,1323 @@ async function handleSlabDrop(e) {
 $slabCanvas.addEventListener('dragover', handleSlabDragOver, true);
 $slabCanvas.addEventListener('dragleave', handleSlabDragLeave, true);
 $slabCanvas.addEventListener('drop', handleSlabDrop, true);
+
+// ===== Feature 3: Full Backup Export/Import =====
+document.getElementById('backup-btn').addEventListener('click', exportBackup);
+document.getElementById('restore-btn').addEventListener('click', () => {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json';
+  input.onchange = () => { if (input.files[0]) importBackup(input.files[0]); };
+  input.click();
+});
+
+async function exportBackup() {
+  // Export ALL profiles
+  const profiles = getProfiles();
+  const allProfileData = {};
+  const STORES = ['notes', 'folders', 'slabs', 'kanban', 'images', 'settings'];
+
+  for (const profile of profiles) {
+    const pdb = await openDBForProfile(profile.id);
+    const profileData = {};
+    for (const store of STORES) {
+      profileData[store] = await new Promise((resolve, reject) => {
+        const tx = pdb.transaction(store, 'readonly');
+        const req = tx.objectStore(store).getAll();
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+    allProfileData[profile.id] = profileData;
+    if (pdb !== db) pdb.close();
+  }
+
+  const data = {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    app: 'de-scribe',
+    profiles: profiles,
+    activeProfile: getActiveProfileId(),
+    profileData: allProfileData
+  };
+
+  const date = new Date().toISOString().slice(0, 10);
+  const defaultName = `de-scribe-backup-${date}`;
+  const fileName = prompt('Name your backup file:', defaultName);
+  if (!fileName) return;
+
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName.endsWith('.json') ? fileName : fileName + '.json';
+  a.click();
+  URL.revokeObjectURL(url);
+  setSaveStatus('saved');
+}
+
+async function importBackup(file) {
+  const text = await file.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    alert('Invalid backup file — could not parse JSON.');
+    return;
+  }
+
+  const STORES = ['notes', 'folders', 'slabs', 'kanban', 'images', 'settings'];
+
+  // Handle legacy v1 backups (no profiles)
+  if (!data.profiles) {
+    if (!data.notes || !data.folders) {
+      alert('Invalid backup file — missing required data.');
+      return;
+    }
+    if (!confirm('This will replace the current profile\'s data. Continue?')) return;
+
+    for (const store of STORES) await dbClearStore(store);
+    for (const note of (data.notes || [])) await dbPut('notes', note);
+    for (const folder of (data.folders || [])) await dbPut('folders', folder);
+    for (const slab of (data.slabs || [])) await dbPut('slabs', slab);
+    for (const kb of (data.kanban || [])) await dbPut('kanban', kb);
+    for (const image of (data.images || [])) await dbPut('images', image);
+    for (const setting of (data.settings || [])) await dbPut('settings', setting);
+
+    allNotes = await dbGetAll('notes');
+    allFolders = await dbGetAll('folders');
+    allSlabBoards = await dbGetAll('slabs') || [];
+    allKanbanBoards = await dbGetAll('kanban') || [];
+    currentNote = null;
+    renderTree();
+    setEditorState(false);
+    setSaveStatus('saved');
+    alert('Backup restored successfully!');
+    return;
+  }
+
+  // Multi-profile backup (v2)
+  const profileCount = data.profiles.length;
+  if (!confirm(`This backup contains ${profileCount} profile(s). This will replace ALL profiles and data. Continue?`)) return;
+
+  // Restore profile list
+  saveProfiles(data.profiles);
+  setActiveProfileId(data.activeProfile || data.profiles[0].id);
+
+  // Restore each profile's data
+  for (const profile of data.profiles) {
+    const pdb = await openDBForProfile(profile.id);
+    const pd = data.profileData[profile.id] || {};
+
+    for (const store of STORES) {
+      await new Promise((resolve, reject) => {
+        const tx = pdb.transaction(store, 'readwrite');
+        tx.objectStore(store).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = e => reject(e.target.error);
+      });
+      for (const item of (pd[store] || [])) {
+        await new Promise((resolve, reject) => {
+          const tx = pdb.transaction(store, 'readwrite');
+          tx.objectStore(store).put(item);
+          tx.oncomplete = () => resolve();
+          tx.onerror = e => reject(e.target.error);
+        });
+      }
+    }
+    if (pdb !== db) pdb.close();
+  }
+
+  // Reload into the active profile
+  await switchProfile(getActiveProfileId());
+  alert(`Restored ${profileCount} profile(s) successfully!`);
+}
+
+// ===== Feature 4: Tag System =====
+function getAllTags() {
+  const tags = new Set();
+  for (const note of allNotes) {
+    if (note.deleted) continue;
+    for (const tag of (note.tags || [])) {
+      tags.add(tag);
+    }
+  }
+  return [...tags].sort();
+}
+
+function renderTagBar() {
+  if (!currentNote) {
+    $tagBar.classList.add('hidden');
+    return;
+  }
+  $tagBar.classList.remove('hidden');
+  $tagChips.innerHTML = '';
+  const tags = currentNote.tags || [];
+  tags.forEach(tag => {
+    const chip = document.createElement('span');
+    chip.className = 'tag-chip';
+    chip.textContent = tag;
+    const remove = document.createElement('span');
+    remove.className = 'tag-chip-remove';
+    remove.innerHTML = '&times;';
+    remove.addEventListener('click', async () => {
+      currentNote.tags = (currentNote.tags || []).filter(t => t !== tag);
+      await dbPut('notes', currentNote);
+      renderTagBar();
+      renderTagFilterBar();
+    });
+    chip.appendChild(remove);
+    $tagChips.appendChild(chip);
+  });
+}
+
+function addTag(tag) {
+  if (!currentNote) return;
+  tag = tag.toLowerCase().trim();
+  if (!tag) return;
+  if (!currentNote.tags) currentNote.tags = [];
+  if (currentNote.tags.includes(tag)) return;
+  currentNote.tags.push(tag);
+  dbPut('notes', currentNote);
+  renderTagBar();
+  renderTagFilterBar();
+}
+
+$tagInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ',') {
+    e.preventDefault();
+    const val = $tagInput.value.replace(/,/g, '').trim();
+    if (val) addTag(val);
+    $tagInput.value = '';
+    hideTagAutocomplete();
+  }
+  if (e.key === 'Backspace' && !$tagInput.value && currentNote && currentNote.tags && currentNote.tags.length) {
+    currentNote.tags.pop();
+    dbPut('notes', currentNote);
+    renderTagBar();
+    renderTagFilterBar();
+  }
+  if (e.key === 'Escape') hideTagAutocomplete();
+});
+
+$tagInput.addEventListener('input', () => {
+  const val = $tagInput.value.toLowerCase().trim();
+  if (!val) { hideTagAutocomplete(); return; }
+  const existing = getAllTags().filter(t => t.includes(val) && !(currentNote.tags || []).includes(t));
+  if (!existing.length) { hideTagAutocomplete(); return; }
+  $tagAutocomplete.innerHTML = '';
+  existing.slice(0, 8).forEach(tag => {
+    const item = document.createElement('div');
+    item.className = 'tag-autocomplete-item';
+    item.textContent = tag;
+    item.addEventListener('click', () => {
+      addTag(tag);
+      $tagInput.value = '';
+      hideTagAutocomplete();
+    });
+    $tagAutocomplete.appendChild(item);
+  });
+  $tagAutocomplete.classList.remove('hidden');
+});
+
+function hideTagAutocomplete() {
+  $tagAutocomplete.classList.add('hidden');
+  $tagAutocomplete.innerHTML = '';
+}
+
+function renderTagFilterBar() {
+  const tags = getAllTags();
+  if (!tags.length) {
+    $tagFilterWrapper.classList.add('hidden');
+    return;
+  }
+  $tagFilterWrapper.classList.remove('hidden');
+  $tagFilterBar.innerHTML = '';
+  tags.forEach(tag => {
+    const chip = document.createElement('button');
+    chip.className = 'tag-filter-chip' + (activeTagFilter === tag ? ' active' : '');
+    chip.textContent = tag;
+    chip.addEventListener('click', () => {
+      activeTagFilter = activeTagFilter === tag ? null : tag;
+      renderTree();
+    });
+    $tagFilterBar.appendChild(chip);
+  });
+}
+
+// ===== Feature 5: Clipboard Image Paste (Slab) =====
+document.addEventListener('paste', e => {
+  // Only handle if slab is visible and editor is not focused
+  if ($neuralSlab.classList.contains('hidden')) return;
+  if (document.activeElement === $editor) return;
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const card = createCardData('image');
+        card.content = reader.result;
+        await saveCard(card);
+        renderSlabCard(card);
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+  }
+});
+
+// ===== Feature 6: Color-Coded Folders =====
+function showFolderColorPicker(folderId) {
+  const folder = allFolders.find(f => f.id === folderId);
+  if (!folder) return;
+
+  // Position near the context menu
+  $folderColorPicker.style.left = $contextMenu.style.left;
+  $folderColorPicker.style.top = (parseInt($contextMenu.style.top) + 40) + 'px';
+  $folderColorPicker.innerHTML = '';
+  $folderColorPicker.classList.remove('hidden');
+
+  // "No color" swatch
+  const noColor = document.createElement('button');
+  noColor.className = 'folder-color-swatch no-color';
+  noColor.title = 'No color';
+  noColor.addEventListener('click', async () => {
+    folder.color = null;
+    await dbPut('folders', folder);
+    renderTree();
+    $folderColorPicker.classList.add('hidden');
+  });
+  $folderColorPicker.appendChild(noColor);
+
+  SLAB_COLORS.forEach(color => {
+    const swatch = document.createElement('button');
+    swatch.className = 'folder-color-swatch';
+    swatch.style.background = color;
+    swatch.title = color;
+    swatch.addEventListener('click', async () => {
+      folder.color = color;
+      await dbPut('folders', folder);
+      renderTree();
+      $folderColorPicker.classList.add('hidden');
+    });
+    $folderColorPicker.appendChild(swatch);
+  });
+
+  // Close on click elsewhere
+  const close = e => {
+    if (!$folderColorPicker.contains(e.target)) {
+      $folderColorPicker.classList.add('hidden');
+      document.removeEventListener('mousedown', close);
+    }
+  };
+  setTimeout(() => document.addEventListener('mousedown', close), 0);
+}
+
+// ===== Feature 7: Word Count Goals =====
+$wordCountWrapper.addEventListener('click', e => {
+  if (!currentNote) return;
+  // Don't trigger when clicking on existing input
+  if (e.target.tagName === 'INPUT') return;
+  const existing = $wordCountWrapper.querySelector('#word-goal-input');
+  if (existing) return;
+
+  const input = document.createElement('input');
+  input.id = 'word-goal-input';
+  input.type = 'number';
+  input.placeholder = 'Goal';
+  input.min = '0';
+  input.value = currentNote.wordGoal || '';
+  $wordCountWrapper.appendChild(input);
+  input.focus();
+  input.select();
+
+  const finish = async () => {
+    const val = parseInt(input.value);
+    currentNote.wordGoal = val > 0 ? val : null;
+    await dbPut('notes', currentNote);
+    input.remove();
+    updateWordCount();
+  };
+
+  input.addEventListener('blur', finish);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') input.blur();
+    if (e.key === 'Escape') { input.value = ''; input.blur(); }
+  });
+});
+
+// ===== Feature 8: WYSIWYG Toggle =====
+let turndownService = null;
+
+function getTurndown() {
+  if (turndownService) return turndownService;
+  if (typeof TurndownService === 'undefined') return null;
+  turndownService = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
+  // Custom rule for wiki links
+  turndownService.addRule('wikiLinks', {
+    filter: node => node.classList && node.classList.contains('wiki-link'),
+    replacement: (content) => `[[${content}]]`
+  });
+  // Custom rule for branch markers
+  turndownService.addRule('branchMarkers', {
+    filter: node => node.classList && node.classList.contains('branch-marker'),
+    replacement: () => ''
+  });
+  return turndownService;
+}
+
+document.getElementById('view-rich').addEventListener('click', () => {
+  if (!getTurndown()) {
+    alert('Turndown.js is still loading. Please try again.');
+    return;
+  }
+  setViewMode('view-rich');
+});
+
+// ===== Venn Diagram View =====
+const $vennView = document.getElementById('venn-view');
+const $vennSvg = document.getElementById('venn-svg');
+const $vennFolderToggles = document.getElementById('venn-folder-toggles');
+const $vennTagSelector = document.getElementById('venn-tag-selector');
+const $vennTooltip = document.getElementById('venn-tooltip');
+const $vennEmpty = document.getElementById('venn-empty');
+
+const $vennTagHeader = document.getElementById('venn-tag-selector-header');
+
+let vennSelectedTags = [];
+let vennEnabledFolders = new Set();
+
+// Collapsible tag selector
+$vennTagHeader.addEventListener('click', () => {
+  $vennTagHeader.classList.toggle('expanded');
+  $vennTagSelector.classList.toggle('collapsed');
+});
+
+function openVennView() {
+  $editorArea.classList.add('hidden');
+  $neuralSlab.classList.add('hidden');
+  $kanbanView.classList.add('hidden');
+  $vennView.classList.remove('hidden');
+
+  // Enable all folders + root by default
+  vennEnabledFolders = new Set(allFolders.map(f => f.id));
+  vennEnabledFolders.add('__root__');
+
+  vennSelectedTags = [];
+  // Expand tag selector on open
+  $vennTagHeader.classList.add('expanded');
+  $vennTagSelector.classList.remove('collapsed');
+  renderVennFolderToggles();
+  renderVennTagSelector();
+  renderVennDiagram();
+}
+
+function closeVennView() {
+  $vennView.classList.add('hidden');
+  $editorArea.classList.remove('hidden');
+}
+
+document.getElementById('venn-btn').addEventListener('click', () => {
+  if ($vennView.classList.contains('hidden')) {
+    openVennView();
+  } else {
+    closeVennView();
+  }
+});
+
+function renderVennFolderToggles() {
+  $vennFolderToggles.innerHTML = '';
+
+  // Unfiled pseudo-folder
+  const items = [{ id: '__root__', name: '\u{1F4C4} Unfiled' }, ...allFolders.map(f => ({ id: f.id, name: '\u{1F4C1} ' + f.name }))];
+  items.forEach(f => {
+    const label = document.createElement('label');
+    label.className = 'venn-folder-toggle';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = vennEnabledFolders.has(f.id);
+    cb.addEventListener('change', () => {
+      if (cb.checked) vennEnabledFolders.add(f.id);
+      else vennEnabledFolders.delete(f.id);
+      renderVennDiagram();
+    });
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(f.name));
+    $vennFolderToggles.appendChild(label);
+  });
+}
+
+function renderVennTagSelector() {
+  $vennTagSelector.innerHTML = '';
+  const tags = getAllTags();
+  const atLimit = vennSelectedTags.length >= 8;
+
+  tags.forEach(tag => {
+    const isSelected = vennSelectedTags.includes(tag);
+    const idx = vennSelectedTags.indexOf(tag);
+
+    const label = document.createElement('label');
+    label.className = 'venn-tag-item';
+    if (atLimit && !isSelected) label.classList.add('disabled');
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = isSelected;
+    cb.addEventListener('change', () => {
+      if (cb.checked && vennSelectedTags.length < 8) {
+        vennSelectedTags.push(tag);
+      } else {
+        vennSelectedTags = vennSelectedTags.filter(t => t !== tag);
+      }
+      renderVennTagSelector();
+      renderVennDiagram();
+    });
+
+    const dot = document.createElement('span');
+    dot.className = 'venn-tag-color';
+    dot.style.background = isSelected ? SLAB_COLORS[idx % SLAB_COLORS.length] : 'transparent';
+
+    label.appendChild(cb);
+    label.appendChild(dot);
+    label.appendChild(document.createTextNode(tag));
+    $vennTagSelector.appendChild(label);
+  });
+}
+
+function getVennLayout(count) {
+  switch (count) {
+    case 2: return [
+      { cx: 0.38, cy: 0.5, r: 0.28 },
+      { cx: 0.62, cy: 0.5, r: 0.28 }
+    ];
+    case 3: return [
+      { cx: 0.5, cy: 0.35, r: 0.25 },
+      { cx: 0.35, cy: 0.6, r: 0.25 },
+      { cx: 0.65, cy: 0.6, r: 0.25 }
+    ];
+    case 4: return [
+      { cx: 0.38, cy: 0.38, r: 0.23 },
+      { cx: 0.62, cy: 0.38, r: 0.23 },
+      { cx: 0.38, cy: 0.62, r: 0.23 },
+      { cx: 0.62, cy: 0.62, r: 0.23 }
+    ];
+    default: {
+      if (count < 2 || count > 8) return [];
+      const out = [];
+      const spread = count <= 5 ? 0.18 : count <= 6 ? 0.20 : 0.22;
+      const r = count <= 5 ? 0.22 : count <= 6 ? 0.20 : 0.18;
+      for (let i = 0; i < count; i++) {
+        const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
+        out.push({ cx: 0.5 + spread * Math.cos(angle), cy: 0.5 + spread * Math.sin(angle), r });
+      }
+      return out;
+    }
+  }
+}
+
+function getVennNotes() {
+  return allNotes.filter(n => {
+    if (n.deleted) return false;
+    const fid = n.folderId || '__root__';
+    if (!vennEnabledFolders.has(fid)) return false;
+    const noteTags = n.tags || [];
+    return vennSelectedTags.some(t => noteTags.includes(t));
+  });
+}
+
+function getRegionCenter(matchingTags, circles) {
+  let cx = 0, cy = 0;
+  matchingTags.forEach(tag => {
+    const idx = vennSelectedTags.indexOf(tag);
+    if (idx >= 0) { cx += circles[idx].cx; cy += circles[idx].cy; }
+  });
+  cx /= matchingTags.length;
+  cy /= matchingTags.length;
+  return { cx, cy };
+}
+
+function distributeDotsAroundCenter(cx, cy, count, spread) {
+  if (count === 1) return [{ x: cx, y: cy }];
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  const points = [];
+  for (let i = 0; i < count; i++) {
+    const r = spread * Math.sqrt((i + 0.5) / count);
+    const theta = i * golden;
+    points.push({ x: cx + r * Math.cos(theta), y: cy + r * Math.sin(theta) });
+  }
+  return points;
+}
+
+function showVennTooltip(evt, note) {
+  const snippet = (note.content || '').replace(/[#*_`>\[\]]/g, '').slice(0, 120);
+  const tags = (note.tags || []).map(t => `<span class="venn-tooltip-tag">${escHtml(t)}</span>`).join('');
+  $vennTooltip.innerHTML =
+    `<div class="venn-tooltip-title">${escHtml(note.title || 'Untitled')}</div>` +
+    `<div class="venn-tooltip-snippet">${escHtml(snippet)}${note.content && note.content.length > 120 ? '...' : ''}</div>` +
+    `<div class="venn-tooltip-tags">${tags}</div>`;
+
+  const rect = $vennSvg.parentElement.getBoundingClientRect();
+  let x = evt.clientX - rect.left + 14;
+  let y = evt.clientY - rect.top + 14;
+  if (x + 280 > rect.width) x = evt.clientX - rect.left - 290;
+  if (y + 120 > rect.height) y = evt.clientY - rect.top - 130;
+  $vennTooltip.style.left = Math.max(0, x) + 'px';
+  $vennTooltip.style.top = Math.max(0, y) + 'px';
+  $vennTooltip.classList.remove('hidden');
+}
+
+function renderVennDiagram() {
+  $vennSvg.innerHTML = '';
+
+  if (vennSelectedTags.length < 2) {
+    $vennEmpty.classList.remove('hidden');
+    return;
+  }
+  $vennEmpty.classList.add('hidden');
+
+  const rect = $vennSvg.parentElement.getBoundingClientRect();
+  const W = rect.width || 600;
+  const H = rect.height || 500;
+  $vennSvg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  $vennSvg.setAttribute('width', W);
+  $vennSvg.setAttribute('height', H);
+
+  const layout = getVennLayout(vennSelectedTags.length);
+  const circles = layout.map((c, i) => ({
+    cx: c.cx * W, cy: c.cy * H, r: c.r * Math.min(W, H),
+    color: SLAB_COLORS[i % SLAB_COLORS.length], tag: vennSelectedTags[i]
+  }));
+
+  const ns = 'http://www.w3.org/2000/svg';
+
+  // Draw circles
+  circles.forEach(c => {
+    const el = document.createElementNS(ns, 'circle');
+    el.setAttribute('cx', c.cx);
+    el.setAttribute('cy', c.cy);
+    el.setAttribute('r', c.r);
+    el.setAttribute('fill', c.color);
+    el.setAttribute('fill-opacity', '0.2');
+    el.setAttribute('stroke', c.color);
+    el.setAttribute('stroke-width', '2');
+    el.classList.add('venn-circle');
+    $vennSvg.appendChild(el);
+  });
+
+  // Draw labels
+  circles.forEach(c => {
+    const txt = document.createElementNS(ns, 'text');
+    txt.setAttribute('x', c.cx);
+    txt.setAttribute('y', c.cy - c.r - 8);
+    txt.classList.add('venn-label');
+    txt.textContent = c.tag;
+    $vennSvg.appendChild(txt);
+  });
+
+  // Classify notes into regions
+  const notes = getVennNotes();
+  const regions = {};
+  notes.forEach(note => {
+    const noteTags = note.tags || [];
+    const matching = vennSelectedTags.filter(t => noteTags.includes(t));
+    if (matching.length === 0) return;
+    const key = matching.sort().join(',');
+    if (!regions[key]) regions[key] = { tags: matching, notes: [] };
+    regions[key].notes.push(note);
+  });
+
+  // Draw note dots per region
+  const dotRadius = 6;
+  const spread = Math.min(W, H) * 0.04;
+
+  Object.values(regions).forEach(region => {
+    const center = getRegionCenter(region.tags, circles);
+    const points = distributeDotsAroundCenter(center.cx, center.cy, region.notes.length, spread);
+
+    region.notes.forEach((note, i) => {
+      const dot = document.createElementNS(ns, 'circle');
+      dot.setAttribute('cx', points[i].x);
+      dot.setAttribute('cy', points[i].y);
+      dot.setAttribute('r', dotRadius);
+
+      // Color: blend of matching tag colors
+      const matchIdx = vennSelectedTags.indexOf(region.tags[0]);
+      dot.setAttribute('fill', SLAB_COLORS[matchIdx % SLAB_COLORS.length]);
+      dot.setAttribute('fill-opacity', '0.85');
+      dot.classList.add('venn-note-dot');
+
+      dot.addEventListener('mouseenter', e => showVennTooltip(e, note));
+      dot.addEventListener('mousemove', e => showVennTooltip(e, note));
+      dot.addEventListener('mouseleave', () => $vennTooltip.classList.add('hidden'));
+      dot.addEventListener('click', () => {
+        closeVennView();
+        openNote(note.id);
+      });
+
+      $vennSvg.appendChild(dot);
+    });
+  });
+}
+
+// Integrate with existing views
+window.addEventListener('resize', () => {
+  if (!$vennView.classList.contains('hidden')) renderVennDiagram();
+});
+
+// ===== Kanban Board =====
+
+function getCurrentKanbanBoard() {
+  return allKanbanBoards.find(b => b.id === currentKanbanId);
+}
+
+async function saveCurrentKanbanBoard() {
+  const board = getCurrentKanbanBoard();
+  if (board) await dbPut('kanban', board);
+}
+
+function openKanbanView(boardId) {
+  currentKanbanId = boardId;
+  $editorArea.classList.add('hidden');
+  $neuralSlab.classList.add('hidden');
+  $vennView.classList.add('hidden');
+  $kanbanView.classList.remove('hidden');
+
+  const board = getCurrentKanbanBoard();
+  if (board) {
+    document.getElementById('kanban-toolbar-name').textContent = '\u2610 ' + board.name;
+  }
+  currentNote = null;
+  renderKanbanBoard();
+  renderTree();
+}
+
+function closeKanbanView() {
+  $kanbanView.classList.add('hidden');
+  $editorArea.classList.remove('hidden');
+  currentKanbanId = null;
+  renderTree();
+}
+
+// Toolbar name double-click to rename
+document.getElementById('kanban-toolbar-name').addEventListener('dblclick', () => {
+  const board = getCurrentKanbanBoard();
+  if (!board) return;
+  const newName = prompt('Rename board:', board.name);
+  if (newName && newName.trim()) {
+    board.name = newName.trim();
+    saveCurrentKanbanBoard();
+    document.getElementById('kanban-toolbar-name').textContent = '\u2610 ' + board.name;
+    renderTree();
+  }
+});
+
+// New kanban board button
+document.getElementById('new-kanban-btn').addEventListener('click', async () => {
+  const board = {
+    id: uid(),
+    name: 'Untitled Board',
+    folderId: null,
+    sortOrder: allKanbanBoards.length,
+    createdAt: Date.now(),
+    columns: [
+      { id: uid(), name: 'To Do', sortOrder: 0, color: SLAB_COLORS[0] },
+      { id: uid(), name: 'In Progress', sortOrder: 1, color: SLAB_COLORS[1] },
+      { id: uid(), name: 'Done', sortOrder: 2, color: SLAB_COLORS[2] }
+    ],
+    cards: []
+  };
+  await dbPut('kanban', board);
+  allKanbanBoards.push(board);
+  renderTree();
+  openKanbanView(board.id);
+});
+
+// Add column
+document.getElementById('kanban-add-col-btn').addEventListener('click', async () => {
+  const board = getCurrentKanbanBoard();
+  if (!board) return;
+  const name = prompt('Column name:');
+  if (!name || !name.trim()) return;
+  const colorIdx = board.columns.length % SLAB_COLORS.length;
+  board.columns.push({ id: uid(), name: name.trim(), sortOrder: board.columns.length, color: SLAB_COLORS[colorIdx] });
+  await saveCurrentKanbanBoard();
+  renderKanbanBoard();
+});
+
+function renderKanbanBoard() {
+  const board = getCurrentKanbanBoard();
+  if (!board) { $kanbanBoard.innerHTML = ''; return; }
+
+  $kanbanBoard.innerHTML = '';
+  const sortedCols = [...board.columns].sort((a, b) => a.sortOrder - b.sortOrder);
+
+  sortedCols.forEach(col => {
+    const colEl = document.createElement('div');
+    colEl.className = 'kanban-column';
+    colEl.style.borderTopColor = col.color || SLAB_COLORS[0];
+    colEl.dataset.columnId = col.id;
+
+    const colCards = board.cards
+      .filter(c => c.columnId === col.id)
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+
+    // Header
+    const header = document.createElement('div');
+    header.className = 'kanban-column-header';
+
+    const nameInput = document.createElement('input');
+    nameInput.className = 'kanban-col-name';
+    nameInput.value = col.name;
+    nameInput.addEventListener('blur', async () => {
+      const newName = nameInput.value.trim() || col.name;
+      col.name = newName;
+      await saveCurrentKanbanBoard();
+    });
+    nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') nameInput.blur(); });
+
+    const count = document.createElement('span');
+    count.className = 'kanban-col-count';
+    count.textContent = colCards.length;
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'kanban-col-delete';
+    delBtn.innerHTML = '&times;';
+    delBtn.title = 'Delete column';
+    delBtn.addEventListener('click', async () => {
+      if (colCards.length > 0 && !confirm(`Delete "${col.name}" and its ${colCards.length} card(s)?`)) return;
+      board.columns = board.columns.filter(c => c.id !== col.id);
+      board.cards = board.cards.filter(c => c.columnId !== col.id);
+      await saveCurrentKanbanBoard();
+      renderKanbanBoard();
+    });
+
+    // Make column draggable via header
+    const dragHandle = document.createElement('span');
+    dragHandle.className = 'kanban-col-drag';
+    dragHandle.textContent = '\u2630';
+    dragHandle.title = 'Drag to reorder';
+    header.append(dragHandle, nameInput, count, delBtn);
+
+    // Track whether mousedown was on the drag handle
+    let colDragAllowed = false;
+    dragHandle.addEventListener('mousedown', () => { colDragAllowed = true; });
+    document.addEventListener('mouseup', () => { colDragAllowed = false; }, { passive: true });
+
+    colEl.draggable = true;
+    colEl.addEventListener('dragstart', e => {
+      if (!colDragAllowed) {
+        e.preventDefault();
+        return;
+      }
+      kanbanDragCol = col.id;
+      colEl.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    colEl.addEventListener('dragend', () => {
+      colEl.classList.remove('dragging');
+      kanbanDragCol = null;
+      document.querySelectorAll('.kanban-column.col-drag-over').forEach(c => c.classList.remove('col-drag-over'));
+    });
+    colEl.addEventListener('dragover', e => {
+      if (kanbanDragCol && kanbanDragCol !== col.id) {
+        e.preventDefault();
+        e.stopPropagation();
+        colEl.classList.add('col-drag-over');
+      }
+    });
+    colEl.addEventListener('dragleave', e => {
+      if (!colEl.contains(e.relatedTarget)) {
+        colEl.classList.remove('col-drag-over');
+      }
+    });
+    colEl.addEventListener('drop', async e => {
+      if (kanbanDragCol && kanbanDragCol !== col.id) {
+        e.preventDefault();
+        e.stopPropagation();
+        colEl.classList.remove('col-drag-over');
+
+        // Reorder: move dragged column to this column's position
+        const sorted = [...board.columns].sort((a, b) => a.sortOrder - b.sortOrder);
+        const dragIdx = sorted.findIndex(c => c.id === kanbanDragCol);
+        const targetIdx = sorted.findIndex(c => c.id === col.id);
+        if (dragIdx !== -1 && targetIdx !== -1) {
+          const [moved] = sorted.splice(dragIdx, 1);
+          sorted.splice(targetIdx, 0, moved);
+          sorted.forEach((c, i) => c.sortOrder = i);
+          await saveCurrentKanbanBoard();
+          renderKanbanBoard();
+        }
+      }
+    });
+
+    // Body (card list)
+    const body = document.createElement('div');
+    body.className = 'kanban-column-body';
+    body.dataset.columnId = col.id;
+
+    colCards.forEach(card => {
+      body.appendChild(createKanbanCardEl(card));
+    });
+
+    // Drag-and-drop on body
+    body.addEventListener('dragover', e => {
+      // For column drags, let the event bubble to the column handler
+      if (kanbanDragCol) return;
+      e.preventDefault();
+      // Handle kanban card drag
+      if (kanbanDragCard) {
+        colEl.classList.add('drag-over');
+        // Remove old placeholder
+        body.querySelectorAll('.kanban-drop-placeholder').forEach(p => p.remove());
+        const placeholder = document.createElement('div');
+        placeholder.className = 'kanban-drop-placeholder';
+
+        const cardEls = [...body.querySelectorAll('.kanban-card:not(.dragging)')];
+        let inserted = false;
+        for (const ce of cardEls) {
+          const rect = ce.getBoundingClientRect();
+          if (e.clientY < rect.top + rect.height / 2) {
+            body.insertBefore(placeholder, ce);
+            inserted = true;
+            break;
+          }
+        }
+        if (!inserted) body.appendChild(placeholder);
+      }
+      // Handle note drag from tree
+      if (dragItem && dragItem.type === 'note') {
+        e.dataTransfer.dropEffect = 'link';
+      }
+    });
+
+    body.addEventListener('dragleave', e => {
+      if (!body.contains(e.relatedTarget)) {
+        colEl.classList.remove('drag-over');
+        body.querySelectorAll('.kanban-drop-placeholder').forEach(p => p.remove());
+      }
+    });
+
+    body.addEventListener('drop', async e => {
+      e.preventDefault();
+      colEl.classList.remove('drag-over');
+      body.querySelectorAll('.kanban-drop-placeholder').forEach(p => p.remove());
+
+      // Handle kanban card drop
+      if (kanbanDragCard) {
+        e.stopPropagation();
+        const card = board.cards.find(c => c.id === kanbanDragCard.cardId);
+        if (card) {
+          card.columnId = col.id;
+          // Calculate insertion index
+          const cardEls = [...body.querySelectorAll('.kanban-card:not(.dragging)')];
+          let insertIdx = cardEls.length;
+          for (let i = 0; i < cardEls.length; i++) {
+            const rect = cardEls[i].getBoundingClientRect();
+            if (e.clientY < rect.top + rect.height / 2) {
+              insertIdx = i;
+              break;
+            }
+          }
+          // Reorder cards in this column
+          const colCardsNow = board.cards
+            .filter(c => c.columnId === col.id && c.id !== card.id)
+            .sort((a, b) => a.sortOrder - b.sortOrder);
+          colCardsNow.splice(insertIdx, 0, card);
+          colCardsNow.forEach((c, i) => c.sortOrder = i);
+          await saveCurrentKanbanBoard();
+          renderKanbanBoard();
+        }
+        return;
+      }
+
+      // Handle note drop from tree onto column body — link to no specific card, ignore
+    });
+
+    // Footer
+    const footer = document.createElement('div');
+    footer.className = 'kanban-column-footer';
+    const addBtn = document.createElement('button');
+    addBtn.textContent = '+ Add card';
+    addBtn.addEventListener('click', async () => {
+      const card = {
+        id: uid(),
+        columnId: col.id,
+        title: 'New Card',
+        description: '',
+        createdAt: Date.now(),
+        dueDate: null,
+        sortOrder: colCards.length,
+        linkedNoteIds: []
+      };
+      board.cards.push(card);
+      await saveCurrentKanbanBoard();
+      renderKanbanBoard();
+    });
+    footer.appendChild(addBtn);
+
+    colEl.append(header, body, footer);
+    $kanbanBoard.appendChild(colEl);
+  });
+}
+
+function createKanbanCardEl(card) {
+  const el = document.createElement('div');
+  el.className = 'kanban-card';
+  el.draggable = true;
+  el.dataset.cardId = card.id;
+
+  const title = document.createElement('div');
+  title.className = 'kanban-card-title';
+  title.textContent = card.title;
+  el.appendChild(title);
+
+  // Meta row
+  const meta = document.createElement('div');
+  meta.className = 'kanban-card-meta';
+  if (card.dueDate) {
+    const dueSpan = document.createElement('span');
+    const dueDate = new Date(card.dueDate);
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    const isOverdue = dueDate < now;
+    dueSpan.textContent = '\uD83D\uDCC5 ' + dueDate.toLocaleDateString();
+    if (isOverdue) dueSpan.className = 'kanban-card-overdue';
+    meta.appendChild(dueSpan);
+  }
+  if (card.linkedNoteIds && card.linkedNoteIds.length > 0) {
+    const linkSpan = document.createElement('span');
+    linkSpan.textContent = '\uD83D\uDD17 ' + card.linkedNoteIds.length;
+    meta.appendChild(linkSpan);
+  }
+  if (meta.childNodes.length > 0) el.appendChild(meta);
+
+  // Click to open modal
+  el.addEventListener('click', e => {
+    if (el.classList.contains('dragging')) return;
+    openKanbanCardModal(card.id);
+  });
+
+  // Drag start/end for card
+  el.addEventListener('dragstart', e => {
+    kanbanDragCard = { cardId: card.id, sourceColumnId: card.columnId };
+    el.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.stopPropagation();
+  });
+
+  el.addEventListener('dragend', () => {
+    el.classList.remove('dragging');
+    kanbanDragCard = null;
+    document.querySelectorAll('.kanban-column.drag-over').forEach(c => c.classList.remove('drag-over'));
+    document.querySelectorAll('.kanban-drop-placeholder').forEach(p => p.remove());
+  });
+
+  // Accept note drops from sidebar tree onto card
+  el.addEventListener('dragover', e => {
+    if (dragItem && dragItem.type === 'note') {
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = 'link';
+      el.style.outline = '2px solid var(--accent)';
+    }
+  });
+
+  el.addEventListener('dragleave', () => {
+    el.style.outline = '';
+  });
+
+  el.addEventListener('drop', async e => {
+    el.style.outline = '';
+    if (dragItem && dragItem.type === 'note') {
+      e.preventDefault();
+      e.stopPropagation();
+      const board = getCurrentKanbanBoard();
+      const boardCard = board.cards.find(c => c.id === card.id);
+      if (boardCard && !boardCard.linkedNoteIds.includes(dragItem.id)) {
+        boardCard.linkedNoteIds.push(dragItem.id);
+        await saveCurrentKanbanBoard();
+        renderKanbanBoard();
+      }
+    }
+  });
+
+  return el;
+}
+
+// ===== Kanban Card Modal =====
+const $kanbanCardModal = document.getElementById('kanban-card-modal');
+
+function openKanbanCardModal(cardId) {
+  const board = getCurrentKanbanBoard();
+  if (!board) return;
+  const card = board.cards.find(c => c.id === cardId);
+  if (!card) return;
+
+  kanbanEditCardId = cardId;
+  document.getElementById('kanban-card-title-input').value = card.title;
+  document.getElementById('kanban-card-desc').value = card.description || '';
+  document.getElementById('kanban-card-due').value = card.dueDate ? new Date(card.dueDate).toISOString().slice(0, 10) : '';
+  document.getElementById('kanban-card-created').textContent = 'Created: ' + new Date(card.createdAt).toLocaleString();
+
+  renderKanbanLinkedNotes(card);
+  $kanbanCardModal.classList.remove('hidden');
+}
+
+function renderKanbanLinkedNotes(card) {
+  const list = document.getElementById('kanban-linked-list');
+  list.innerHTML = '';
+  (card.linkedNoteIds || []).forEach(noteId => {
+    const note = allNotes.find(n => n.id === noteId);
+    const row = document.createElement('div');
+    row.className = 'kanban-linked-note';
+
+    const icon = document.createElement('span');
+    icon.textContent = '\uD83D\uDCC4';
+    icon.style.flexShrink = '0';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = note ? note.title : '(deleted note)';
+    nameSpan.addEventListener('click', () => {
+      if (note) {
+        closeKanbanCardModal();
+        closeKanbanView();
+        openNote(note.id);
+      }
+    });
+
+    const removeBtn = document.createElement('button');
+    removeBtn.textContent = '\u00d7';
+    removeBtn.title = 'Remove link';
+    removeBtn.addEventListener('click', async () => {
+      card.linkedNoteIds = card.linkedNoteIds.filter(id => id !== noteId);
+      await saveCurrentKanbanBoard();
+      renderKanbanLinkedNotes(card);
+    });
+
+    row.append(icon, nameSpan, removeBtn);
+    list.appendChild(row);
+  });
+}
+
+function closeKanbanCardModal() {
+  $kanbanCardModal.classList.add('hidden');
+  kanbanEditCardId = null;
+}
+
+// Modal close button
+document.getElementById('kanban-modal-close').addEventListener('click', closeKanbanCardModal);
+$kanbanCardModal.addEventListener('click', e => {
+  if (e.target === $kanbanCardModal) closeKanbanCardModal();
+});
+
+// Save button
+document.getElementById('kanban-card-save').addEventListener('click', async () => {
+  const board = getCurrentKanbanBoard();
+  if (!board || !kanbanEditCardId) return;
+  const card = board.cards.find(c => c.id === kanbanEditCardId);
+  if (!card) return;
+
+  card.title = document.getElementById('kanban-card-title-input').value.trim() || 'Untitled';
+  card.description = document.getElementById('kanban-card-desc').value;
+  const dueVal = document.getElementById('kanban-card-due').value;
+  card.dueDate = dueVal ? new Date(dueVal + 'T00:00:00').getTime() : null;
+
+  await saveCurrentKanbanBoard();
+  closeKanbanCardModal();
+  renderKanbanBoard();
+});
+
+// Delete button
+document.getElementById('kanban-card-delete').addEventListener('click', async () => {
+  const board = getCurrentKanbanBoard();
+  if (!board || !kanbanEditCardId) return;
+  if (!confirm('Delete this card?')) return;
+  board.cards = board.cards.filter(c => c.id !== kanbanEditCardId);
+  await saveCurrentKanbanBoard();
+  closeKanbanCardModal();
+  renderKanbanBoard();
+});
+
+// Accept note drops on linked notes list in modal
+const $kanbanLinkedList = document.getElementById('kanban-linked-list');
+$kanbanLinkedList.addEventListener('dragover', e => {
+  if (dragItem && dragItem.type === 'note') {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'link';
+    $kanbanLinkedList.classList.add('drag-over');
+  }
+});
+$kanbanLinkedList.addEventListener('dragleave', () => {
+  $kanbanLinkedList.classList.remove('drag-over');
+});
+$kanbanLinkedList.addEventListener('drop', async e => {
+  $kanbanLinkedList.classList.remove('drag-over');
+  if (dragItem && dragItem.type === 'note' && kanbanEditCardId) {
+    e.preventDefault();
+    const board = getCurrentKanbanBoard();
+    if (!board) return;
+    const card = board.cards.find(c => c.id === kanbanEditCardId);
+    if (card && !card.linkedNoteIds.includes(dragItem.id)) {
+      card.linkedNoteIds.push(dragItem.id);
+      await saveCurrentKanbanBoard();
+      renderKanbanLinkedNotes(card);
+    }
+  }
+});
+
+// ===== Profile System UI =====
+
+async function switchProfile(profileId) {
+  // Close current DB
+  if (db) db.close();
+
+  setActiveProfileId(profileId);
+  db = null;
+  await openDB();
+
+  // Reset all state
+  allNotes = await dbGetAll('notes');
+  allFolders = await dbGetAll('folders');
+  allSlabBoards = await dbGetAll('slabs') || [];
+  allKanbanBoards = await dbGetAll('kanban') || [];
+  currentNote = null;
+  currentSlabId = null;
+  currentKanbanId = null;
+
+  // Hide special views
+  $kanbanView.classList.add('hidden');
+  $neuralSlab.classList.add('hidden');
+  $vennView.classList.add('hidden');
+  $editorArea.classList.remove('hidden');
+
+  // Restore theme/sidebar for this profile
+  const theme = await dbGet('settings', 'theme');
+  if (theme) document.documentElement.setAttribute('data-theme', theme.value);
+
+  const sidebarWidth = await dbGet('settings', 'sidebarWidth');
+  if (sidebarWidth) $sidebar.style.width = sidebarWidth.value + 'px';
+
+  renderTree();
+  setEditorState(false);
+  renderProfileSwitcher();
+  setSaveStatus('saved');
+}
+
+function renderProfileSwitcher() {
+  const container = document.getElementById('profile-switcher');
+  if (!container) return;
+  const profiles = getProfiles();
+  const activeId = getActiveProfileId();
+  const active = profiles.find(p => p.id === activeId) || profiles[0];
+
+  container.innerHTML = '';
+
+  const btn = document.createElement('button');
+  btn.id = 'profile-btn';
+  btn.title = 'Switch profile';
+  btn.textContent = '\uD83D\uDC64 ' + (active ? active.name : 'Default');
+  container.appendChild(btn);
+
+  const dropdown = document.createElement('div');
+  dropdown.id = 'profile-dropdown';
+  dropdown.className = 'hidden';
+
+  profiles.forEach(p => {
+    const item = document.createElement('button');
+    item.className = 'profile-item' + (p.id === activeId ? ' active' : '');
+    item.textContent = p.name;
+    item.addEventListener('click', async e => {
+      e.stopPropagation();
+      dropdown.classList.add('hidden');
+      if (p.id !== activeId) await switchProfile(p.id);
+    });
+    dropdown.appendChild(item);
+  });
+
+  const divider = document.createElement('div');
+  divider.className = 'profile-divider';
+  dropdown.appendChild(divider);
+
+  const newBtn = document.createElement('button');
+  newBtn.className = 'profile-item profile-action';
+  newBtn.textContent = '+ New Profile';
+  newBtn.addEventListener('click', async e => {
+    e.stopPropagation();
+    dropdown.classList.add('hidden');
+    const name = prompt('Profile name:');
+    if (!name || !name.trim()) return;
+    const profiles = getProfiles();
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    profiles.push({ id, name: name.trim() });
+    saveProfiles(profiles);
+    await switchProfile(id);
+  });
+  dropdown.appendChild(newBtn);
+
+  const renameBtn = document.createElement('button');
+  renameBtn.className = 'profile-item profile-action';
+  renameBtn.textContent = '\u270E Rename Profile';
+  renameBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    dropdown.classList.add('hidden');
+    const profiles = getProfiles();
+    const current = profiles.find(p => p.id === activeId);
+    if (!current) return;
+    const newName = prompt('Rename profile:', current.name);
+    if (!newName || !newName.trim()) return;
+    current.name = newName.trim();
+    saveProfiles(profiles);
+    renderProfileSwitcher();
+  });
+  dropdown.appendChild(renameBtn);
+
+  const delBtn = document.createElement('button');
+  delBtn.className = 'profile-item profile-action profile-danger';
+  delBtn.textContent = '\uD83D\uDDD1 Delete Profile';
+  delBtn.addEventListener('click', async e => {
+    e.stopPropagation();
+    dropdown.classList.add('hidden');
+    let profiles = getProfiles();
+    if (profiles.length <= 1) {
+      alert('Cannot delete the only profile.');
+      return;
+    }
+    const current = profiles.find(p => p.id === activeId);
+    if (!confirm(`Delete profile "${current.name}" and all its data?`)) return;
+
+    // Delete the profile's database
+    if (db) db.close();
+    db = null;
+    const dbName = getDBName(activeId);
+    await new Promise((resolve, reject) => {
+      const req = indexedDB.deleteDatabase(dbName);
+      req.onsuccess = () => resolve();
+      req.onerror = e => reject(e.target.error);
+      req.onblocked = () => resolve();
+    });
+
+    profiles = profiles.filter(p => p.id !== activeId);
+    saveProfiles(profiles);
+    await switchProfile(profiles[0].id);
+  });
+  dropdown.appendChild(delBtn);
+
+  container.appendChild(dropdown);
+
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    dropdown.classList.toggle('hidden');
+  });
+
+  // Close dropdown on outside click
+  document.addEventListener('click', () => {
+    dropdown.classList.add('hidden');
+  });
+}
 
 // ===== Start =====
 init();

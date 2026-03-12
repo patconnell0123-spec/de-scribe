@@ -21,7 +21,9 @@
       <input type="text" id="header-search-input" placeholder="Search notes..." autocomplete="off">
       <div id="header-search-dropdown" class="hidden"></div>
     </div>
+    <div id="profile-switcher"></div>
     <div id="header-actions">
+      <button id="venn-btn" aria-label="Venn Diagram" title="Venn Diagram">&#9901;</button>
       <button id="theme-btn" aria-label="Toggle theme" title="Toggle theme">&#9790;</button>
     </div>
   </header>
@@ -32,7 +34,22 @@
         <button id="new-note-btn" title="New Note">&#128196; New Note</button>
         <button id="new-folder-btn" title="New Folder">&#128193; New Folder</button>
         <button id="new-slab-btn" title="New Neural Slab">&#129520; Neural Slab</button>
+        <button id="new-kanban-btn" title="New To-Do Board">&#9744; To-Do</button>
         <button id="brain-dump-btn" title="Brain Dump">&#129504; Brain Dump</button>
+        <button id="backup-btn" title="Backup all data">&#128190; Backup</button>
+        <button id="restore-btn" title="Restore from backup">&#128229; Restore</button>
+      </div>
+      <div id="tag-filter-wrapper" class="hidden">
+        <div id="tag-filter-header">Tags <span id="tag-filter-arrow">&#9654;</span></div>
+        <div id="tag-filter-bar" class="collapsed"></div>
+      </div>
+      <div id="pinned-notes" class="hidden">
+        <div id="pinned-header">&#128204; Pinned</div>
+        <ul id="pinned-list"></ul>
+      </div>
+      <div id="template-drawer">
+        <div id="template-header">&#128220; Templates <span id="template-arrow">&#9654;</span></div>
+        <div id="template-list" class="collapsed"></div>
       </div>
       <nav id="file-tree"></nav>
       <div id="sidebar-resize-handle"></div>
@@ -59,11 +76,20 @@
         <button id="view-edit" title="Edit only" class="view-btn active">Edit</button>
         <button id="view-split" title="Split view" class="view-btn">Split</button>
         <button id="view-preview" title="Preview only" class="view-btn">Preview</button>
+        <button id="view-rich" title="Rich text (WYSIWYG)" class="view-btn">Rich</button>
         <button id="export-btn" title="Export">&#128190; Export</button>
       </div>
 
       <div id="note-title-bar" class="hidden">
         <input id="note-title-input" type="text" placeholder="Note title..." spellcheck="false" autocomplete="off">
+      </div>
+
+      <div id="tag-bar" class="hidden">
+        <div id="tag-chips"></div>
+        <div id="tag-input-wrapper">
+          <input id="tag-input" type="text" placeholder="Add tag..." autocomplete="off">
+          <div id="tag-autocomplete" class="hidden"></div>
+        </div>
       </div>
 
       <div id="editor-container" class="view-split">
@@ -85,8 +111,14 @@
       </div>
 
       <div id="status-bar">
-        <span id="status-msg">Ready</span>
-        <span id="word-count">0 words</span>
+        <div id="status-left">
+          <span id="save-dot"></span>
+          <span id="status-msg">Ready</span>
+        </div>
+        <div id="word-count-wrapper">
+          <div id="word-goal-bar"></div>
+          <span id="word-count">0 words</span>
+        </div>
       </div>
 
       <div id="empty-state">
@@ -95,6 +127,32 @@
         <p>Your data never leaves this device.</p>
       </div>
     </main>
+
+    <div id="venn-view" class="hidden">
+      <div id="venn-sidebar">
+        <div id="venn-sidebar-header">Folders</div>
+        <div id="venn-folder-toggles"></div>
+        <div id="venn-sidebar-divider"></div>
+        <div id="venn-tag-selector-header">Tags (pick up to 8) <span id="venn-tag-arrow">&#9654;</span></div>
+        <div id="venn-tag-selector" class="collapsed"></div>
+      </div>
+      <div id="venn-main">
+        <svg id="venn-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div id="venn-tooltip" class="hidden"></div>
+        <div id="venn-empty">Select 2–5 tags to visualize</div>
+      </div>
+    </div>
+
+    <div id="kanban-view" class="hidden">
+      <div id="kanban-toolbar">
+        <span id="kanban-toolbar-name">&#9744;</span>
+        <div id="kanban-tools">
+          <button id="kanban-add-col-btn" title="Add column">&#10010; Column</button>
+        </div>
+        <div id="kanban-toolbar-spacer"></div>
+      </div>
+      <div id="kanban-board"></div>
+    </div>
 
     <div id="neural-slab" class="hidden">
       <div id="slab-toolbar">
@@ -156,15 +214,48 @@ Call dentist" spellcheck="true"></textarea>
     </div>
   </div>
 
+  <!-- Kanban Card Detail Modal -->
+  <div id="kanban-card-modal" class="modal hidden">
+    <div class="modal-content kanban-modal-content">
+      <div class="modal-header">
+        <h3>Edit Card</h3>
+        <button id="kanban-modal-close">&times;</button>
+      </div>
+      <div id="kanban-modal-body">
+        <label>Title</label>
+        <input id="kanban-card-title-input" type="text" placeholder="Card title..." autocomplete="off">
+        <label>Description</label>
+        <textarea id="kanban-card-desc" placeholder="Add a description..." rows="4"></textarea>
+        <label>Due Date</label>
+        <input id="kanban-card-due" type="date">
+        <div id="kanban-card-created"></div>
+        <div id="kanban-linked-notes">
+          <label>Linked Notes <span id="kanban-link-hint">(drag notes here)</span></label>
+          <div id="kanban-linked-list"></div>
+        </div>
+      </div>
+      <div id="kanban-modal-actions">
+        <button id="kanban-card-delete" class="modal-cancel">&#128465; Delete</button>
+        <button id="kanban-card-save">Save</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Context Menu -->
   <div id="context-menu" class="hidden">
     <button data-ctx="new-note" id="ctx-new-note">&#128196; New Note</button>
     <button data-ctx="rename">&#9998; Rename</button>
+    <button data-ctx="pin" id="ctx-pin">&#128204; Pin</button>
+    <button data-ctx="color" id="ctx-color">&#127912; Color</button>
     <button data-ctx="delete">&#128465; Delete</button>
   </div>
 
+  <!-- Folder Color Picker -->
+  <div id="folder-color-picker" class="hidden"></div>
+
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/turndown/dist/turndown.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
