@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>De'Scribe</title>
+  <meta name="description" content="A local-first markdown notes app">
+  <meta name="theme-color" content="#1e1e2e">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="header">
+    <button id="sidebar-toggle" aria-label="Toggle sidebar">&#9776;</button>
+    <h1>De'Scribe</h1>
+    <div id="header-search">
+      <span id="header-search-icon">&#128269;</span>
+      <input type="text" id="header-search-input" placeholder="Search notes..." autocomplete="off">
+      <div id="header-search-dropdown" class="hidden"></div>
+    </div>
+    <div id="header-actions">
+      <button id="theme-btn" aria-label="Toggle theme" title="Toggle theme">&#9790;</button>
+    </div>
+  </header>
+
+  <div id="app">
+    <aside id="sidebar">
+      <div id="sidebar-actions">
+        <button id="new-note-btn" title="New Note">&#128196; New Note</button>
+        <button id="new-folder-btn" title="New Folder">&#128193; New Folder</button>
+        <button id="new-slab-btn" title="New Neural Slab">&#129520; Neural Slab</button>
+        <button id="brain-dump-btn" title="Brain Dump">&#129504; Brain Dump</button>
+      </div>
+      <nav id="file-tree"></nav>
+      <div id="sidebar-resize-handle"></div>
+    </aside>
+
+    <main id="editor-area">
+      <div id="toolbar">
+        <button data-action="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+        <button data-action="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+        <button data-action="h1" title="Heading 1">H1</button>
+        <button data-action="h2" title="Heading 2">H2</button>
+        <button data-action="h3" title="Heading 3">H3</button>
+        <button data-action="code" title="Code">&#60;/&#62;</button>
+        <button data-action="codeblock" title="Code Block">&#9114;</button>
+        <button data-action="link" title="Link (Ctrl+K)">&#128279;</button>
+        <button data-action="image" title="Insert Image">&#128247;</button>
+        <button data-action="ul" title="Bullet List">&#8226;</button>
+        <button data-action="ol" title="Numbered List">1.</button>
+        <button data-action="blockquote" title="Blockquote">&#10077;</button>
+        <button data-action="hr" title="Horizontal Rule">&#8213;</button>
+        <button data-action="breakaway" id="breakaway-btn" title="Break Away — branch a new version from cursor">&#9582; Break Away</button>
+        <button id="screeeeh-btn" title="Insert alien filler text">&#128126; Screeeeh</button>
+        <div id="toolbar-spacer"></div>
+        <button id="view-edit" title="Edit only" class="view-btn active">Edit</button>
+        <button id="view-split" title="Split view" class="view-btn">Split</button>
+        <button id="view-preview" title="Preview only" class="view-btn">Preview</button>
+        <button id="export-btn" title="Export">&#128190; Export</button>
+      </div>
+
+      <div id="note-title-bar" class="hidden">
+        <input id="note-title-input" type="text" placeholder="Note title..." spellcheck="false" autocomplete="off">
+      </div>
+
+      <div id="editor-container" class="view-split">
+        <div id="editor-highlight" aria-hidden="true"></div>
+        <textarea id="editor" placeholder="Start writing markdown..." spellcheck="true"></textarea>
+        <div id="minimap">
+          <div id="minimap-content"></div>
+          <div id="minimap-viewport"></div>
+        </div>
+        <div id="preview"></div>
+      </div>
+
+      <div id="branch-panel" class="hidden">
+        <div id="branch-panel-header">
+          <span id="branch-panel-title">&#9582; Branch Map</span>
+          <button id="branch-panel-toggle" aria-label="Collapse branch panel">&#9660;</button>
+        </div>
+        <div id="branch-canvas"></div>
+      </div>
+
+      <div id="status-bar">
+        <span id="status-msg">Ready</span>
+        <span id="word-count">0 words</span>
+      </div>
+
+      <div id="empty-state">
+        <h2>Welcome to De'Scribe</h2>
+        <p>Create a note or folder to get started.</p>
+        <p>Your data never leaves this device.</p>
+      </div>
+    </main>
+
+    <div id="neural-slab" class="hidden">
+      <div id="slab-toolbar">
+        <span id="slab-toolbar-name">&#129520;</span>
+        <div id="slab-tools">
+          <button id="slab-add-text-btn" title="Add text card">&#128196; Text</button>
+          <button id="slab-add-heading-btn" title="Add heading card">&#9733; Heading</button>
+          <button id="slab-add-image-btn" title="Add image card">&#128247; Image</button>
+        </div>
+        <div id="slab-toolbar-spacer"></div>
+        <span id="slab-zoom-label">100%</span>
+        <button id="slab-zoom-in" title="Zoom in">+</button>
+        <button id="slab-zoom-out" title="Zoom out">&minus;</button>
+        <button id="slab-zoom-reset" title="Reset zoom">&#8634;</button>
+      </div>
+      <div id="slab-canvas">
+        <svg id="slab-connections" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div id="slab-surface"></div>
+        <svg id="slab-drag-line" xmlns="http://www.w3.org/2000/svg" class="hidden"></svg>
+        <div id="slab-drop-hint" class="hidden">Drop note here to link it</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Brain Dump Modal -->
+  <div id="braindump-modal" class="modal hidden">
+    <div class="modal-content braindump-content">
+      <div class="modal-header">
+        <h3>&#129504; Brain Dump</h3>
+        <button id="braindump-close">&times;</button>
+      </div>
+      <div id="braindump-hint">
+        Use <code># Folder Name</code> to group lines below it into that folder.<br>
+        Each line becomes a separate note.
+      </div>
+      <textarea id="braindump-editor" placeholder="# Work
+Meeting notes from today
+Follow up on project X
+
+# Personal
+Buy groceries
+Call dentist" spellcheck="true"></textarea>
+      <div id="braindump-preview"></div>
+      <div id="braindump-actions">
+        <button id="braindump-cancel" class="modal-cancel">Cancel</button>
+        <button id="braindump-sort">Sort &amp; Create Notes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Modal -->
+  <div id="export-modal" class="modal hidden">
+    <div class="modal-content modal-small">
+      <h3>Export Note</h3>
+      <button class="export-option" data-format="md">&#128196; Markdown (.md)</button>
+      <button class="export-option" data-format="txt">&#128196; Plain Text (.txt)</button>
+      <button class="export-option" data-format="pdf">&#128424; Print / PDF</button>
+      <button id="export-close" class="modal-cancel">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Context Menu -->
+  <div id="context-menu" class="hidden">
+    <button data-ctx="new-note" id="ctx-new-note">&#128196; New Note</button>
+    <button data-ctx="rename">&#9998; Rename</button>
+    <button data-ctx="delete">&#128465; Delete</button>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
