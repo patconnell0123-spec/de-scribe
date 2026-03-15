@@ -283,6 +283,7 @@ button {
 #header-actions {
   display: flex;
   gap: 4px;
+  margin-left: auto;
 }
 
 #header-actions button {
@@ -1761,10 +1762,16 @@ button {
   padding-top: 8px !important;
 }
 
-#backup-btn, #restore-btn {
+#backup-btn, #restore-btn, #auto-backup-btn {
   font-size: 11px !important;
   padding: 4px 6px !important;
   opacity: 0.8;
+}
+
+#auto-backup-btn.auto-backup-active {
+  opacity: 1;
+  background: var(--accent);
+  color: var(--bg-primary);
 }
 
 /* ===== Context Menu ===== */
@@ -2258,6 +2265,136 @@ button {
 
   #editor { padding: 16px; }
   #preview { padding: 16px; }
+}
+
+/* ===== Manual Mobile Viewport Toggle ===== */
+html[data-viewport="mobile"] #sidebar-toggle { display: block; }
+
+html[data-viewport="mobile"] #sidebar {
+  position: fixed;
+  top: 48px;
+  left: 0;
+  bottom: 0;
+  z-index: 50;
+  transform: translateX(-100%);
+  transition: transform 0.2s ease;
+  width: 280px !important;
+}
+
+html[data-viewport="mobile"] #sidebar.open {
+  transform: translateX(0);
+}
+
+html[data-viewport="mobile"] #sidebar-resize-handle { display: none; }
+
+html[data-viewport="mobile"] #editor-container.view-split #editor,
+html[data-viewport="mobile"] #editor-container.view-split #preview {
+  width: 100%;
+}
+
+html[data-viewport="mobile"] #editor-container.view-split {
+  flex-direction: column;
+}
+
+html[data-viewport="mobile"] #editor-container.view-split #preview {
+  border-left: none;
+  border-top: 1px solid var(--border);
+}
+
+html[data-viewport="mobile"] #editor { padding: 16px; }
+html[data-viewport="mobile"] #preview { padding: 16px; }
+
+/* Mobile toolbar: move Break Away & Screeeeh to lower row, left of view buttons */
+html[data-viewport="mobile"] #toolbar-spacer {
+  flex-basis: 100%;
+  height: 0;
+}
+html[data-viewport="mobile"] #breakaway-btn {
+  order: 10;
+  margin-left: 0;
+}
+html[data-viewport="mobile"] #screeeeh-btn {
+  order: 11;
+}
+html[data-viewport="mobile"] #view-edit {
+  order: 12;
+  margin-left: auto;
+}
+html[data-viewport="mobile"] .view-btn {
+  order: 12;
+}
+html[data-viewport="mobile"] #export-btn {
+  order: 13;
+}
+
+/* Lock zoom on mobile */
+html[data-viewport="mobile"] {
+  touch-action: manipulation;
+}
+
+/* Full-screen search overlay (mobile) */
+html[data-viewport="mobile"] #header-search.mobile-search-open {
+  position: fixed;
+  top: 6px;
+  left: 6px;
+  right: 6px;
+  bottom: 6px;
+  max-width: none;
+  margin: 0;
+  z-index: 200;
+  background: var(--bg-primary);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 32px var(--shadow);
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+}
+
+html[data-viewport="mobile"] #header-search.mobile-search-open #header-search-input {
+  font-size: 16px;
+  padding: 10px 12px 10px 36px;
+}
+
+html[data-viewport="mobile"] #header-search.mobile-search-open #header-search-dropdown {
+  position: relative;
+  top: auto;
+  left: auto;
+  right: auto;
+  max-height: none;
+  flex: 1;
+  overflow-y: auto;
+  margin-top: 8px;
+  border: none;
+  box-shadow: none;
+  border-radius: 8px;
+}
+
+html[data-viewport="mobile"] #header-search.mobile-search-open .dropdown-result {
+  padding: 12px 14px;
+  font-size: 14px;
+}
+
+html[data-viewport="mobile"] #header-search.mobile-search-open .dropdown-result-title {
+  font-size: 15px;
+}
+
+html[data-viewport="mobile"] #header-search.mobile-search-open .dropdown-result-snippet {
+  font-size: 13px;
+}
+
+#viewport-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+#viewport-btn:hover {
+  background: var(--bg-hover);
 }
 
 /* ===== Venn Diagram View ===== */

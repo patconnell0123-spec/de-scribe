@@ -448,6 +448,14 @@ async function init() {
   const lastView = await dbGet('settings', 'viewMode');
   if (lastView) setViewMode(lastView.value);
 
+  const viewport = await dbGet('settings', 'viewport');
+  if (viewport && viewport.value === 'mobile') {
+    document.documentElement.setAttribute('data-viewport', 'mobile');
+    document.getElementById('viewport-btn').innerHTML = '&#128421;';
+    setViewportMeta(true);
+    setViewMode('view-rich');
+  }
+
   await loadSlabs();
   allKanbanBoards = await dbGetAll('kanban') || [];
 
@@ -865,6 +873,7 @@ function showContextMenu(x, y, type, id) {
   $contextMenu.style.left = x + 'px';
   $contextMenu.style.top = y + 'px';
   document.getElementById('ctx-new-note').style.display = type === 'folder' ? '' : 'none';
+  document.getElementById('ctx-new-subfolder').style.display = type === 'folder' ? '' : 'none';
 
   // Pin option: only for notes
   const pinBtn = document.getElementById('ctx-pin');
@@ -911,6 +920,23 @@ $contextMenu.addEventListener('click', async e => {
     renderTree();
     openNote(note.id);
     startInlineRename('note', note.id);
+  }
+
+  if (action === 'new-subfolder') {
+    const subfolder = {
+      id: uid(),
+      parentId: ctxTarget.id,
+      name: 'New Folder',
+      sortOrder: allFolders.length,
+      collapsed: false
+    };
+    await dbPut('folders', subfolder);
+    allFolders.push(subfolder);
+    // Expand the parent folder
+    const parent = allFolders.find(f => f.id === ctxTarget.id);
+    if (parent && parent.collapsed) { parent.collapsed = false; await dbPut('folders', parent); }
+    renderTree();
+    startInlineRename('folder', subfolder.id);
   }
 
   if (action === 'pin') {
@@ -2385,6 +2411,7 @@ function closeSearchDropdown() {
   $searchDropdown.classList.add('hidden');
   $searchDropdown.innerHTML = '';
   searchSelectedIdx = -1;
+  document.getElementById('header-search').classList.remove('mobile-search-open');
 }
 
 $searchInput.addEventListener('input', () => {
@@ -2475,12 +2502,55 @@ document.addEventListener('click', e => {
   }
 });
 
+// Mobile search overlay open/close
+const $headerSearch = document.getElementById('header-search');
+$searchInput.addEventListener('focus', () => {
+  if (document.documentElement.getAttribute('data-viewport') === 'mobile') {
+    $headerSearch.classList.add('mobile-search-open');
+  }
+});
+$searchInput.addEventListener('blur', () => {
+  setTimeout(() => {
+    $headerSearch.classList.remove('mobile-search-open');
+  }, 150);
+});
+
 // ===== Theme Toggle =====
 document.getElementById('theme-btn').addEventListener('click', async () => {
   const current = document.documentElement.getAttribute('data-theme');
   const next = current === 'dark' ? 'light' : 'dark';
   document.documentElement.setAttribute('data-theme', next);
   await dbPut('settings', { key: 'theme', value: next });
+});
+
+// ===== Viewport Toggle =====
+function setViewportMeta(mobile) {
+  let meta = document.querySelector('meta[name="viewport"]');
+  if (!meta) {
+    meta = document.createElement('meta');
+    meta.name = 'viewport';
+    document.head.appendChild(meta);
+  }
+  meta.content = mobile
+    ? 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'
+    : 'width=device-width, initial-scale=1.0';
+}
+
+document.getElementById('viewport-btn').addEventListener('click', async () => {
+  const html = document.documentElement;
+  const isMobile = html.getAttribute('data-viewport') === 'mobile';
+  if (isMobile) {
+    html.removeAttribute('data-viewport');
+    document.getElementById('viewport-btn').innerHTML = '\u{1F4F1}';
+    setViewportMeta(false);
+    await dbPut('settings', { key: 'viewport', value: 'desktop' });
+  } else {
+    html.setAttribute('data-viewport', 'mobile');
+    document.getElementById('viewport-btn').innerHTML = '\u{1F5A5}';
+    setViewportMeta(true);
+    setViewMode('view-rich');
+    await dbPut('settings', { key: 'viewport', value: 'mobile' });
+  }
 });
 
 // ===== Export =====
@@ -2529,7 +2599,7 @@ document.getElementById('sidebar-toggle').addEventListener('click', () => {
 
 // Close sidebar on mobile when clicking a note
 $tree.addEventListener('click', e => {
-  if (window.innerWidth <= 768 && e.target.closest('.tree-item[data-type="note"]')) {
+  if ((window.innerWidth <= 768 || document.documentElement.getAttribute('data-viewport') === 'mobile') && e.target.closest('.tree-item[data-type="note"]')) {
     $sidebar.classList.remove('open');
   }
 });
@@ -3690,6 +3760,42 @@ function getTurndown() {
     filter: node => node.classList && node.classList.contains('branch-marker'),
     replacement: () => ''
   });
+
+  // Table support: keep tables intact when converting HTML back to markdown
+  turndownService.addRule('tableCell', {
+    filter: ['th', 'td'],
+    replacement: (content, node) => {
+      const trimmed = content.replace(/\n/g, ' ').trim();
+      return ' ' + trimmed + ' |';
+    }
+  });
+  turndownService.addRule('tableRow', {
+    filter: 'tr',
+    replacement: (content, node) => {
+      let row = '|' + content + '\n';
+      // If this is the first row in a thead, or the first row of the table, add separator
+      const parent = node.parentNode;
+      const isHeaderRow = parent.nodeName === 'THEAD' ||
+        (parent.nodeName === 'TABLE' && parent.rows[0] === node) ||
+        (parent.nodeName === 'TBODY' && !node.previousElementSibling && !parent.previousElementSibling);
+      if (isHeaderRow) {
+        const cellCount = node.cells ? node.cells.length : (content.match(/\|/g) || []).length;
+        row += '|' + ' --- |'.repeat(cellCount) + '\n';
+      }
+      return row;
+    }
+  });
+  turndownService.addRule('table', {
+    filter: 'table',
+    replacement: (content) => {
+      return '\n\n' + content.trim() + '\n\n';
+    }
+  });
+  turndownService.addRule('tableSection', {
+    filter: ['thead', 'tbody', 'tfoot'],
+    replacement: (content) => content
+  });
+
   return turndownService;
 }
 
@@ -4641,6 +4747,124 @@ function renderProfileSwitcher() {
     dropdown.classList.add('hidden');
   });
 }
+
+// ===== Auto-Backup (every 10 minutes to De'Scribe Backups folder) =====
+let autoBackupDirHandle = null;
+let autoBackupInterval = null;
+const AUTO_BACKUP_MS = 10 * 60 * 1000; // 10 minutes
+const AUTO_BACKUP_MAX = 20; // keep last 20 backups
+
+async function getBackupData() {
+  const profiles = getProfiles();
+  const allProfileData = {};
+  const STORES = ['notes', 'folders', 'slabs', 'kanban', 'images', 'settings'];
+  for (const profile of profiles) {
+    const pdb = await openDBForProfile(profile.id);
+    const profileData = {};
+    for (const store of STORES) {
+      profileData[store] = await new Promise((resolve, reject) => {
+        const tx = pdb.transaction(store, 'readonly');
+        const req = tx.objectStore(store).getAll();
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+    allProfileData[profile.id] = profileData;
+    if (pdb !== db) pdb.close();
+  }
+  return {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    app: 'de-scribe',
+    profiles: profiles,
+    activeProfile: getActiveProfileId(),
+    profileData: allProfileData
+  };
+}
+
+async function performAutoBackup() {
+  if (!autoBackupDirHandle) return;
+  try {
+    // Verify we still have permission
+    if ((await autoBackupDirHandle.queryPermission({ mode: 'readwrite' })) !== 'granted') {
+      stopAutoBackup();
+      return;
+    }
+    const data = await getBackupData();
+    const now = new Date();
+    const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const fileName = `de-scribe-backup-${timestamp}.json`;
+    const fileHandle = await autoBackupDirHandle.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify(data, null, 2));
+    await writable.close();
+
+    // Prune old backups — keep only the most recent ones
+    const entries = [];
+    for await (const [name, handle] of autoBackupDirHandle) {
+      if (handle.kind === 'file' && name.startsWith('de-scribe-backup-') && name.endsWith('.json')) {
+        entries.push(name);
+      }
+    }
+    entries.sort();
+    while (entries.length > AUTO_BACKUP_MAX) {
+      const oldest = entries.shift();
+      await autoBackupDirHandle.removeEntry(oldest);
+    }
+
+    setSaveStatus('saved');
+    console.log('[Auto-Backup] Saved:', fileName);
+  } catch (err) {
+    console.warn('[Auto-Backup] Failed:', err);
+  }
+}
+
+function startAutoBackup() {
+  if (autoBackupInterval) clearInterval(autoBackupInterval);
+  autoBackupInterval = setInterval(performAutoBackup, AUTO_BACKUP_MS);
+  // Also run one immediately
+  performAutoBackup();
+  updateAutoBackupBtn();
+}
+
+function stopAutoBackup() {
+  if (autoBackupInterval) clearInterval(autoBackupInterval);
+  autoBackupInterval = null;
+  autoBackupDirHandle = null;
+  localStorage.removeItem('describeAutoBackup');
+  updateAutoBackupBtn();
+}
+
+function updateAutoBackupBtn() {
+  const btn = document.getElementById('auto-backup-btn');
+  if (!btn) return;
+  if (autoBackupDirHandle) {
+    btn.title = 'Auto-backup ON (every 10 min) — click to disable';
+    btn.classList.add('auto-backup-active');
+  } else {
+    btn.title = 'Enable auto-backup (every 10 min)';
+    btn.classList.remove('auto-backup-active');
+  }
+}
+
+document.getElementById('auto-backup-btn').addEventListener('click', async () => {
+  if (autoBackupDirHandle) {
+    stopAutoBackup();
+    return;
+  }
+  try {
+    const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'documents' });
+    // Try to get or create the "De'Scribe Backups" subfolder
+    autoBackupDirHandle = await dirHandle.getDirectoryHandle("De'Scribe Backups", { create: true });
+    localStorage.setItem('describeAutoBackup', 'enabled');
+    startAutoBackup();
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.warn('[Auto-Backup] Setup failed:', err);
+      alert('Could not set up auto-backup: ' + err.message);
+    }
+  }
+});
 
 // ===== Start =====
 init();

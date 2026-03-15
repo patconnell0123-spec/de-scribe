@@ -24,6 +24,7 @@
     <div id="profile-switcher"></div>
     <div id="header-actions">
       <button id="venn-btn" aria-label="Venn Diagram" title="Venn Diagram">&#9901;</button>
+      <button id="viewport-btn" aria-label="Toggle mobile view" title="Toggle mobile view">&#128241;</button>
       <button id="theme-btn" aria-label="Toggle theme" title="Toggle theme">&#9790;</button>
     </div>
   </header>
@@ -38,6 +39,7 @@
         <button id="brain-dump-btn" title="Brain Dump">&#129504; Brain Dump</button>
         <button id="backup-btn" title="Backup all data">&#128190; Backup</button>
         <button id="restore-btn" title="Restore from backup">&#128229; Restore</button>
+        <button id="auto-backup-btn" title="Enable auto-backup (every 10 min)">&#128260; Auto-Backup</button>
       </div>
       <div id="tag-filter-wrapper" class="hidden">
         <div id="tag-filter-header">Tags <span id="tag-filter-arrow">&#9654;</span></div>
@@ -75,8 +77,8 @@
         <div id="toolbar-spacer"></div>
         <button id="view-edit" title="Edit only" class="view-btn active">Edit</button>
         <button id="view-split" title="Split view" class="view-btn">Split</button>
-        <button id="view-preview" title="Preview only" class="view-btn">Preview</button>
         <button id="view-rich" title="Rich text (WYSIWYG)" class="view-btn">Rich</button>
+        <button id="view-preview" title="Preview only" class="view-btn">Preview</button>
         <button id="export-btn" title="Export">&#128190; Export</button>
       </div>
 
@@ -244,6 +246,7 @@ Call dentist" spellcheck="true"></textarea>
   <!-- Context Menu -->
   <div id="context-menu" class="hidden">
     <button data-ctx="new-note" id="ctx-new-note">&#128196; New Note</button>
+    <button data-ctx="new-subfolder" id="ctx-new-subfolder">&#128193; New Sub-Folder</button>
     <button data-ctx="rename">&#9998; Rename</button>
     <button data-ctx="pin" id="ctx-pin">&#128204; Pin</button>
     <button data-ctx="color" id="ctx-color">&#127912; Color</button>
